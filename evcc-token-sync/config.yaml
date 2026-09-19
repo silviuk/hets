@@ -1,0 +1,23 @@
+name: "EVCC Test Token Auto-Sync"
+slug: "evcc_token_sync"
+description: "Automatically extracts and updates the renewed EVCC test sponsor token into EVCC"
+url: "https://github.com/silviuk/ha-evcc-token-sync"
+version: "1.0.0"
+startup: "services"
+boot: "auto"
+arch:
+  - aarch64
+  - amd64
+  - armhf
+  - armv7
+  - i386
+options:
+  evcc_url: "http://a0d7b954-evcc:7070"
+  check_interval_hours: 6
+  notify_ha: true
+schema:
+  evcc_url: "str"
+  check_interval_hours: "int"
+  notify_ha: "bool"
+homeassistant_api: true
+hassio_api: true

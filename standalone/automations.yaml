@@ -1,0 +1,18 @@
+# Example Home Assistant configuration for standalone usage
+
+# In configuration.yaml:
+# shell_command:
+#   sync_evcc_token: "python3 /config/scripts/evcc_token_sync.py --evcc-url http://a0d7b954-evcc:7070"
+
+# In automations.yaml:
+- id: "evcc_renew_test_token"
+  alias: "EVCC - Auto Renew Test Token"
+  description: "Checks and refreshes the EVCC trial sponsor token daily"
+  trigger:
+    - platform: time
+      at: "03:00:00"
+    - platform: homeassistant
+      event: start
+  action:
+    - service: shell_command.sync_evcc_token
+  mode: single
