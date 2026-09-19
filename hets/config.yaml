@@ -5,6 +5,9 @@ url: "https://github.com/silviuk/hets"
 version: "1.0.0"
 startup: "services"
 boot: "auto"
+apptype: "app"
+app_type: "app"
+stage: "stable"
 arch:
   - aarch64
   - amd64

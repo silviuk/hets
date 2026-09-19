@@ -7,14 +7,14 @@ on:
     branches: [ main ]
 
 jobs:
-  lint-addon:
-    name: Lint Home Assistant Add-on
+  lint-app:
+    name: Lint Home Assistant App
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Home Assistant Add-on Linter
+      - name: Home Assistant App / Add-on Linter
         uses: frenck/action-addon-linter@v2
         with:
           path: "./hets"
