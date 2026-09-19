@@ -2,7 +2,7 @@ name: "HETS (EVCC Test Token Auto-Sync)"
 slug: "hets"
 description: "Automatically extracts and updates the renewed EVCC test sponsor token into EVCC"
 url: "https://github.com/silviuk/hets"
-version: "1.0.5"
+version: "1.0.6"
 startup: "services"
 boot: "auto"
 init: false
@@ -17,11 +17,11 @@ arch:
   - armv7
   - i386
 options:
-  evcc_url: "http://127.0.0.1:7070"
+  evcc_url: ""
   check_interval_hours: 6
   notify_ha: true
 schema:
-  evcc_url: "str"
+  evcc_url: "str?"
   check_interval_hours: "int"
   notify_ha: "bool"
 homeassistant_api: true

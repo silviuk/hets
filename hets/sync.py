@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import re
+import socket
 import sys
 import time
 import urllib.error
@@ -26,7 +27,7 @@ logger = logging.getLogger("hets_sync")
 
 OPTIONS_PATH = "/data/options.json"
 CONFIG = {
-    "evcc_url": "http://127.0.0.1:7070",
+    "evcc_url": "",
     "check_interval_hours": 6,
     "notify_ha": True,
 }
@@ -92,6 +93,52 @@ def fetch_latest_token() -> str | None:
     return best_token
 
 
+def detect_host_lan_ips() -> list[str]:
+    """Detects local LAN/interface IP addresses of the host machine."""
+    ips = set()
+
+    # Method 1: Outbound socket route resolution
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("1.1.1.1", 80))
+            ip = s.getsockname()[0]
+            if ip and not ip.startswith("127."):
+                ips.add(ip)
+    except Exception:
+        pass
+
+    # Method 2: Hostname address info
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None):
+            ip = info[4][0]
+            if ip and not ip.startswith("127.") and ":" not in ip:
+                ips.add(ip)
+    except Exception:
+        pass
+
+    # Method 3: Supervisor Network API
+    supervisor_token = os.environ.get("SUPERVISOR_TOKEN")
+    if supervisor_token:
+        try:
+            req = urllib.request.Request(
+                "http://supervisor/network/info",
+                headers={"Authorization": f"Bearer {supervisor_token}"},
+            )
+            with urllib.request.urlopen(req, timeout=4) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                interfaces = data.get("data", {}).get("interfaces", [])
+                for iface in interfaces:
+                    ipv4 = iface.get("ipv4", {})
+                    for addr in ipv4.get("address", []):
+                        ip_clean = addr.split("/")[0]
+                        if ip_clean and not ip_clean.startswith("127."):
+                            ips.add(ip_clean)
+        except Exception as err:
+            logger.debug("Supervisor network info error: %s", err)
+
+    return list(ips)
+
+
 def discover_evcc_from_supervisor() -> list[str]:
     """Queries Home Assistant Supervisor to auto-discover EVCC add-on hostname/slug."""
     supervisor_token = os.environ.get("SUPERVISOR_TOKEN")
@@ -132,22 +179,27 @@ def get_candidate_evcc_urls() -> list[str]:
     if configured:
         candidates.append(configured)
 
-    # Add discovered supervisor add-on hostnames
+    # 1. External/LAN host interface IPs (since EVCC listens on host interface)
+    lan_ips = detect_host_lan_ips()
+    for ip in lan_ips:
+        candidates.append(f"http://{ip}:7070")
+
+    # 2. Discovered supervisor add-on hostnames
     candidates.extend(discover_evcc_from_supervisor())
 
-    # Fallback host network and local addresses
+    # 3. Local loopback and common mDNS names
     candidates.extend([
-        "http://127.0.0.1:7070",
-        "http://localhost:7070",
         "http://homeassistant.local:7070",
         "http://homeassistant:7070",
+        "http://127.0.0.1:7070",
+        "http://localhost:7070",
         "http://a0d7b954-evcc:7070",
         "http://a0d7b954_evcc:7070",
         "http://evcc:7070",
         "http://local-evcc:7070",
     ])
 
-    # Deduplicate while preserving order
+    # Deduplicate while preserving priority order
     seen = set()
     result = []
     for c in candidates:
@@ -211,8 +263,8 @@ def push_token_to_evcc(token: str) -> bool:
             except Exception as err:
                 errors.append(f"{endpoint} -> {err}")
 
-    logger.error("Could not reach EVCC at any candidate endpoints:")
-    for err in errors[:5]:  # Log first 5 failure reasons
+    logger.error("Could not reach EVCC at candidate endpoints:")
+    for err in errors[:5]:
         logger.error("  - %s", err)
     logger.info("TIP: In HETS App Configuration, set 'evcc_url' to your exact EVCC IP:port (e.g. http://192.168.1.50:7070)")
     return False
@@ -287,7 +339,10 @@ def run_sync_cycle(last_token: str | None) -> str | None:
 
 def main():
     logger.info("Starting EVCC Test Token Auto-Sync service (HETS)")
-    logger.info("Configured EVCC URL: %s", CONFIG.get("evcc_url"))
+    lan_ips = detect_host_lan_ips()
+    logger.info("Detected Host LAN IPs: %s", lan_ips)
+    if CONFIG.get("evcc_url"):
+        logger.info("Configured EVCC URL: %s", CONFIG.get("evcc_url"))
     interval_hours = max(1, int(CONFIG.get("check_interval_hours", 6)))
     logger.info("Check interval: every %d hours", interval_hours)
 

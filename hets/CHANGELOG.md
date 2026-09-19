@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.6
+- Added automatic host LAN network interface detection (connects to EVCC on physical host IP e.g. `192.168.x.x:7070` when EVCC binds to external network interface).
+- Made `evcc_url` optional with automatic fallback probing.
+
 ## 1.0.5
 - Added Home Assistant Supervisor API discovery for automatic EVCC add-on slug resolution.
 - Added detailed diagnostic error logging per endpoint.
