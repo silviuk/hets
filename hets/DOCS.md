@@ -1,6 +1,6 @@
-# Home Assistant Add-on: EVCC Test Token Auto-Sync
+# Home Assistant Add-on: HETS (EVCC Test Token Auto-Sync)
 
-Automatically checks the official EVCC documentation and sponsorship endpoints for renewed test/trial sponsor tokens and updates your EVCC instance via its live REST API.
+**HETS** automatically checks the official EVCC documentation and sponsorship endpoints for renewed test/trial sponsor tokens and updates your EVCC instance via its live REST API.
 
 ## Configuration
 
