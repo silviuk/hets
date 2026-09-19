@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
 HETS (EVCC Test Token Auto-Sync)
-Automatically checks for renewed/updated EVCC trial sponsor tokens
-and updates the local EVCC instance.
+Intelligently syncs EVCC test sponsor tokens just before expiration.
 """
 
 import base64
@@ -28,7 +27,6 @@ logger = logging.getLogger("hets_sync")
 OPTIONS_PATH = "/data/options.json"
 CONFIG = {
     "evcc_url": "",
-    "check_interval_hours": 6,
     "notify_ha": True,
 }
 
@@ -64,8 +62,8 @@ def decode_jwt_payload(token: str) -> dict:
         return {}
 
 
-def fetch_latest_token() -> str | None:
-    """Scrapes candidate sources for the latest valid sponsor JWT."""
+def fetch_latest_token() -> tuple[str | None, int]:
+    """Scrapes candidate sources for the latest sponsor JWT and returns (token, exp_timestamp)."""
     jwt_regex = re.compile(r"eyJ[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+")
     best_token = None
     latest_exp = 0
@@ -76,7 +74,7 @@ def fetch_latest_token() -> str | None:
                 url,
                 headers={"User-Agent": "HomeAssistant-HETS/1.0"},
             )
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            with urllib.request.urlopen(req, timeout=12) as resp:
                 text = resp.read().decode("utf-8", errors="ignore")
 
             matches = jwt_regex.findall(text)
@@ -86,18 +84,16 @@ def fetch_latest_token() -> str | None:
                 if exp > latest_exp:
                     latest_exp = exp
                     best_token = candidate
-                    logger.debug("Found candidate token in %s (exp: %s)", url, exp)
         except Exception as err:
             logger.debug("Error checking source %s: %s", url, err)
 
-    return best_token
+    return best_token, latest_exp
 
 
 def detect_host_lan_ips() -> list[str]:
     """Detects local LAN/interface IP addresses of the host machine."""
     ips = set()
 
-    # Method 1: Outbound socket route resolution
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.connect(("1.1.1.1", 80))
@@ -107,7 +103,6 @@ def detect_host_lan_ips() -> list[str]:
     except Exception:
         pass
 
-    # Method 2: Hostname address info
     try:
         for info in socket.getaddrinfo(socket.gethostname(), None):
             ip = info[4][0]
@@ -116,7 +111,6 @@ def detect_host_lan_ips() -> list[str]:
     except Exception:
         pass
 
-    # Method 3: Supervisor Network API
     supervisor_token = os.environ.get("SUPERVISOR_TOKEN")
     if supervisor_token:
         try:
@@ -161,7 +155,7 @@ def discover_evcc_from_supervisor() -> list[str]:
                 slug = addon.get("slug", "")
                 name = addon.get("name", "")
                 if "evcc" in slug.lower() or "evcc" in name.lower():
-                    logger.info("Discovered EVCC add-on in Supervisor: slug='%s', state='%s'", slug, addon.get("state"))
+                    logger.info("Discovered EVCC in Supervisor: slug='%s', state='%s'", slug, addon.get("state"))
                     discovered.append(f"http://{slug}:7070")
                     discovered.append(f"http://{slug.replace('_', '-')}:7070")
                     discovered.append(f"http://{slug.replace('-', '_')}:7070")
@@ -179,15 +173,12 @@ def get_candidate_evcc_urls() -> list[str]:
     if configured:
         candidates.append(configured)
 
-    # 1. External/LAN host interface IPs (since EVCC listens on host interface)
     lan_ips = detect_host_lan_ips()
     for ip in lan_ips:
         candidates.append(f"http://{ip}:7070")
 
-    # 2. Discovered supervisor add-on hostnames
     candidates.extend(discover_evcc_from_supervisor())
 
-    # 3. Local loopback and common mDNS names
     candidates.extend([
         "http://homeassistant.local:7070",
         "http://homeassistant:7070",
@@ -196,10 +187,8 @@ def get_candidate_evcc_urls() -> list[str]:
         "http://a0d7b954-evcc:7070",
         "http://a0d7b954_evcc:7070",
         "http://evcc:7070",
-        "http://local-evcc:7070",
     ])
 
-    # Deduplicate while preserving priority order
     seen = set()
     result = []
     for c in candidates:
@@ -209,8 +198,8 @@ def get_candidate_evcc_urls() -> list[str]:
     return result
 
 
-def get_current_evcc_token() -> str | None:
-    """Fetches the currently active sponsor token from EVCC API."""
+def get_current_evcc_token() -> tuple[str | None, int]:
+    """Fetches currently configured token from EVCC state API and returns (token, exp_timestamp)."""
     for base_url in get_candidate_evcc_urls():
         try:
             req = urllib.request.Request(
@@ -221,52 +210,56 @@ def get_current_evcc_token() -> str | None:
                 data = json.loads(resp.read().decode("utf-8"))
                 result = data.get("result", {})
                 token = result.get("sponsorToken") or result.get("sponsortoken")
-                if token is not None:
-                    return token
+                if token:
+                    payload = decode_jwt_payload(token)
+                    return token, payload.get("exp", 0)
         except Exception:
             continue
-    return None
+    return None, 0
 
 
 def push_token_to_evcc(token: str) -> bool:
-    """Posts the new token to EVCC configuration endpoint across candidate URLs."""
+    """
+    Posts the new token to EVCC configuration endpoints.
+    Tries official /api/sponsortoken, /config/sponsortoken, /sponsortoken.
+    """
     candidate_urls = get_candidate_evcc_urls()
-    errors = []
+    api_paths = ["/api/sponsortoken", "/config/sponsortoken", "/sponsortoken", "/api/config/sponsortoken"]
+    payload_formats = [
+        ("application/json", json.dumps({"token": token}).encode("utf-8")),
+        ("application/json", json.dumps({"sponsortoken": token}).encode("utf-8")),
+        ("text/plain", token.encode("utf-8")),
+    ]
 
     for base_url in candidate_urls:
-        endpoint = f"{base_url}/api/sponsortoken"
-        payloads = [{"token": token}, {"sponsortoken": token}]
-
-        for payload in payloads:
-            try:
-                data = json.dumps(payload).encode("utf-8")
-                req = urllib.request.Request(
-                    endpoint,
-                    data=data,
-                    headers={
-                        "Content-Type": "application/json",
-                        "User-Agent": "HomeAssistant-HETS/1.0",
-                    },
-                    method="POST",
-                )
-                with urllib.request.urlopen(req, timeout=4) as resp:
-                    if resp.status in [200, 204]:
-                        logger.info("Successfully connected and pushed token to EVCC at %s", endpoint)
+        for path in api_paths:
+            endpoint = f"{base_url}{path}"
+            for content_type, data in payload_formats:
+                try:
+                    req = urllib.request.Request(
+                        endpoint,
+                        data=data,
+                        headers={
+                            "Content-Type": content_type,
+                            "User-Agent": "HomeAssistant-HETS/1.0",
+                        },
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(req, timeout=4) as resp:
+                        if resp.status in [200, 204]:
+                            logger.info("Successfully pushed token to EVCC at %s", endpoint)
+                            CONFIG["evcc_url"] = base_url
+                            return True
+                except urllib.error.HTTPError as err:
+                    if err.code in [200, 204]:
+                        logger.info("Successfully pushed token to EVCC at %s (HTTP %s)", endpoint, err.code)
                         CONFIG["evcc_url"] = base_url
                         return True
-            except urllib.error.HTTPError as err:
-                if err.code in [200, 204]:
-                    logger.info("Successfully pushed token to EVCC at %s (HTTP %s)", endpoint, err.code)
-                    CONFIG["evcc_url"] = base_url
-                    return True
-                errors.append(f"{endpoint} -> HTTP {err.code}: {err.reason}")
-            except Exception as err:
-                errors.append(f"{endpoint} -> {err}")
+                    logger.debug("HTTP %s from %s", err.code, endpoint)
+                except Exception as err:
+                    logger.debug("Connection failed to %s: %s", endpoint, err)
 
-    logger.error("Could not reach EVCC at candidate endpoints:")
-    for err in errors[:5]:
-        logger.error("  - %s", err)
-    logger.info("TIP: In HETS App Configuration, set 'evcc_url' to your exact EVCC IP:port (e.g. http://192.168.1.50:7070)")
+    logger.error("Could not reach EVCC at any candidate endpoints.")
     return False
 
 
@@ -277,7 +270,6 @@ def send_ha_notification(title: str, message: str) -> None:
 
     supervisor_token = os.environ.get("SUPERVISOR_TOKEN")
     if not supervisor_token:
-        logger.debug("SUPERVISOR_TOKEN not set; skipping Home Assistant notification")
         return
 
     try:
@@ -302,58 +294,65 @@ def send_ha_notification(title: str, message: str) -> None:
         logger.warning("Failed sending HA persistent notification: %s", err)
 
 
-def run_sync_cycle(last_token: str | None) -> str | None:
-    logger.info("Scanning official sources for updated test sponsor tokens...")
-    latest_token = fetch_latest_token()
-
-    if not latest_token:
-        logger.warning("No candidate sponsor token found across sources.")
-        return last_token
-
-    payload = decode_jwt_payload(latest_token)
-    exp_ts = payload.get("exp")
-    exp_str = (
-        datetime.fromtimestamp(exp_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-        if exp_ts
-        else "Unknown"
-    )
-
-    current_evcc_token = get_current_evcc_token()
-
-    if latest_token == last_token or (current_evcc_token and latest_token == current_evcc_token):
-        logger.info("EVCC token is up to date (Expires: %s).", exp_str)
-        return latest_token
-
-    logger.info("New or renewed token detected! Expiration: %s", exp_str)
-    if push_token_to_evcc(latest_token):
-        logger.info("EVCC sponsor token updated successfully!")
-        send_ha_notification(
-            title="EVCC Sponsor Token Renewed",
-            message=f"EVCC test sponsor token has been automatically renewed.\n\n**Valid until:** {exp_str}",
-        )
-        return latest_token
-    else:
-        logger.error("Failed to apply new token to EVCC. Check that EVCC is running.")
-        return last_token
+def format_timestamp(ts: int) -> str:
+    if not ts:
+        return "Unknown"
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
 def main():
-    logger.info("Starting EVCC Test Token Auto-Sync service (HETS)")
+    logger.info("Starting HETS (Smart Expiry EVCC Test Token Auto-Sync)")
     lan_ips = detect_host_lan_ips()
     logger.info("Detected Host LAN IPs: %s", lan_ips)
-    if CONFIG.get("evcc_url"):
-        logger.info("Configured EVCC URL: %s", CONFIG.get("evcc_url"))
-    interval_hours = max(1, int(CONFIG.get("check_interval_hours", 6)))
-    logger.info("Check interval: every %d hours", interval_hours)
 
-    last_token = None
+    active_token = None
+    active_exp = 0
+
     while True:
-        try:
-            last_token = run_sync_cycle(last_token)
-        except Exception as err:
-            logger.error("Unexpected error during sync cycle: %s", err, exc_info=True)
+        now = int(time.time())
+        logger.info("Checking for EVCC test sponsor token...")
+        latest_token, latest_exp = fetch_latest_token()
 
-        time.sleep(interval_hours * 3600)
+        if not latest_token:
+            logger.warning("No token found from upstream sources. Will retry in 2 minutes.")
+            time.sleep(120)
+            continue
+
+        exp_str = format_timestamp(latest_exp)
+        seconds_left = latest_exp - now
+
+        if latest_token != active_token or seconds_left <= 0:
+            logger.info("New/Renewed token found (Expires: %s, remaining: %ds)", exp_str, seconds_left)
+            if push_token_to_evcc(latest_token):
+                active_token = latest_token
+                active_exp = latest_exp
+                send_ha_notification(
+                    title="EVCC Sponsor Token Renewed",
+                    message=f"EVCC test sponsor token renewed successfully.\n\n**Valid until:** {exp_str}",
+                )
+            else:
+                logger.error("Failed to push token to EVCC. Will retry in 60s...")
+                time.sleep(60)
+                continue
+        else:
+            logger.info("Current token is active (Expires: %s)", exp_str)
+
+        # Re-calculate remaining seconds
+        now = int(time.time())
+        seconds_left = active_exp - now
+
+        if seconds_left > 300:
+            # Token is valid for more than 5 minutes -> Sleep until 4 minutes before expiry
+            sleep_duration = seconds_left - 240  # 4 mins before expiry
+            # Cap maximum sleep at 1 hour for regular health checking
+            sleep_duration = min(sleep_duration, 3600)
+            wake_time = format_timestamp(now + sleep_duration)
+            logger.info("Token valid for %d minutes. Sleeping until %s (4 min before expiration).", seconds_left // 60, wake_time)
+            time.sleep(sleep_duration)
+        else:
+            # Within 5 minutes of expiration -> Active poll every 60s for the newly published token
+            logger.info("Token is near/past expiration (%ds remaining). Actively polling upstream every 60s...", max(0, seconds_left))
+            time.sleep(60)
 
 
 if __name__ == "__main__":

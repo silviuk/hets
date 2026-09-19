@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.7
+- Added **Smart Expiry Timing**: Sleeps automatically until 4 minutes prior to token expiration, then actively checks every 60s for the newly published token.
+- Verified and expanded EVCC configuration endpoints (`/api/sponsortoken`, `/config/sponsortoken`, `/sponsortoken`) supporting JSON and raw payloads.
+
 ## 1.0.6
 - Added automatic host LAN network interface detection (connects to EVCC on physical host IP e.g. `192.168.x.x:7070` when EVCC binds to external network interface).
 - Made `evcc_url` optional with automatic fallback probing.
