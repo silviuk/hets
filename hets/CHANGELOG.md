@@ -1,5 +1,8 @@
 # Changelog
 
+## 1.0.4
+- Added `host_network: true` and automatic endpoint discovery across `127.0.0.1`, `localhost`, `homeassistant.local`, and container hostnames (resolves DNS resolution errors like `Name has no usable address`).
+
 ## 1.0.3
 - Switched HTTP engine to pure Python standard library (`urllib.request`) for zero external dependencies (resolves `ModuleNotFoundError: No module named 'requests'`).
 

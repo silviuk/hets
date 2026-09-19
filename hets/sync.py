@@ -27,7 +27,7 @@ logger = logging.getLogger("hets_sync")
 
 OPTIONS_PATH = "/data/options.json"
 CONFIG = {
-    "evcc_url": "http://a0d7b954-evcc:7070",
+    "evcc_url": "http://127.0.0.1:7070",
     "check_interval_hours": 6,
     "notify_ha": True,
 }
@@ -93,48 +93,84 @@ def fetch_latest_token() -> str | None:
     return best_token
 
 
+def get_candidate_evcc_urls() -> list[str]:
+    """Builds a prioritized list of EVCC candidate endpoints."""
+    configured = CONFIG.get("evcc_url", "http://127.0.0.1:7070").rstrip("/")
+    candidates = [
+        configured,
+        "http://127.0.0.1:7070",
+        "http://localhost:7070",
+        "http://homeassistant.local:7070",
+        "http://a0d7b954-evcc:7070",
+        "http://a0d7b954_evcc:7070",
+        "http://evcc:7070",
+        "http://local-evcc:7070",
+    ]
+    # Deduplicate while preserving order
+    seen = set()
+    result = []
+    for c in candidates:
+        if c and c not in seen:
+            seen.add(c)
+            result.append(c)
+    return result
+
+
 def get_current_evcc_token() -> str | None:
     """Fetches the currently active sponsor token from EVCC API."""
-    evcc_url = CONFIG.get("evcc_url", "").rstrip("/")
-    try:
-        req = urllib.request.Request(f"{evcc_url}/api/state", headers={"User-Agent": "HomeAssistant-HETS/1.0"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            result = data.get("result", {})
-            return result.get("sponsorToken") or result.get("sponsortoken")
-    except Exception as err:
-        logger.debug("Could not fetch current state from EVCC: %s", err)
+    for base_url in get_candidate_evcc_urls():
+        try:
+            req = urllib.request.Request(
+                f"{base_url}/api/state",
+                headers={"User-Agent": "HomeAssistant-HETS/1.0"},
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                result = data.get("result", {})
+                token = result.get("sponsorToken") or result.get("sponsortoken")
+                if token is not None:
+                    return token
+        except Exception:
+            continue
     return None
 
 
 def push_token_to_evcc(token: str) -> bool:
-    """Posts the new token to EVCC configuration endpoint."""
-    evcc_url = CONFIG.get("evcc_url", "").rstrip("/")
-    endpoint = f"{evcc_url}/api/sponsortoken"
+    """Posts the new token to EVCC configuration endpoint across candidate URLs."""
+    candidate_urls = get_candidate_evcc_urls()
 
-    payloads = [{"token": token}, {"sponsortoken": token}]
-    for payload in payloads:
-        try:
-            data = json.dumps(payload).encode("utf-8")
-            req = urllib.request.Request(
-                endpoint,
-                data=data,
-                headers={
-                    "Content-Type": "application/json",
-                    "User-Agent": "HomeAssistant-HETS/1.0",
-                },
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                if resp.status in [200, 204]:
+    for base_url in candidate_urls:
+        endpoint = f"{base_url}/api/sponsortoken"
+        payloads = [{"token": token}, {"sponsortoken": token}]
+
+        for payload in payloads:
+            try:
+                data = json.dumps(payload).encode("utf-8")
+                req = urllib.request.Request(
+                    endpoint,
+                    data=data,
+                    headers={
+                        "Content-Type": "application/json",
+                        "User-Agent": "HomeAssistant-HETS/1.0",
+                    },
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    if resp.status in [200, 204]:
+                        logger.info("Successfully pushed token to EVCC at %s", endpoint)
+                        # Remember working URL
+                        CONFIG["evcc_url"] = base_url
+                        return True
+            except urllib.error.HTTPError as err:
+                if err.code in [200, 204]:
+                    logger.info("Successfully pushed token to EVCC at %s (code %s)", endpoint, err.code)
+                    CONFIG["evcc_url"] = base_url
                     return True
-        except urllib.error.HTTPError as err:
-            if err.code in [200, 204]:
-                return True
-            logger.error("HTTP error sending token to %s: %s", endpoint, err)
-        except Exception as err:
-            logger.error("Error sending token to %s: %s", endpoint, err)
+                logger.debug("HTTP Error at %s: %s", endpoint, err)
+            except Exception as err:
+                logger.debug("Connection failed to %s: %s", endpoint, err)
 
+    logger.error("Could not reach any EVCC endpoints: %s", candidate_urls)
     return False
 
 
@@ -194,14 +230,14 @@ def run_sync_cycle(last_token: str | None) -> str | None:
 
     logger.info("New or renewed token detected! Expiration: %s", exp_str)
     if push_token_to_evcc(latest_token):
-        logger.info("Successfully updated EVCC sponsor token via API!")
+        logger.info("EVCC sponsor token updated successfully!")
         send_ha_notification(
             title="EVCC Sponsor Token Renewed",
             message=f"EVCC test sponsor token has been automatically renewed.\n\n**Valid until:** {exp_str}",
         )
         return latest_token
     else:
-        logger.error("Failed to apply new token to EVCC.")
+        logger.error("Failed to apply new token to EVCC. Check that EVCC is running.")
         return last_token
 
 
