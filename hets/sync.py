@@ -3,7 +3,6 @@
 HETS (EVCC Test Token Auto-Sync)
 Automatically checks for renewed/updated EVCC trial sponsor tokens
 and updates the local EVCC instance.
-Uses pure standard library for zero-dependency reliability.
 """
 
 import base64
@@ -93,19 +92,61 @@ def fetch_latest_token() -> str | None:
     return best_token
 
 
+def discover_evcc_from_supervisor() -> list[str]:
+    """Queries Home Assistant Supervisor to auto-discover EVCC add-on hostname/slug."""
+    supervisor_token = os.environ.get("SUPERVISOR_TOKEN")
+    if not supervisor_token:
+        return []
+
+    discovered = []
+    try:
+        req = urllib.request.Request(
+            "http://supervisor/addons",
+            headers={
+                "Authorization": f"Bearer {supervisor_token}",
+                "Content-Type": "application/json",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            addons = data.get("data", {}).get("addons", [])
+            for addon in addons:
+                slug = addon.get("slug", "")
+                name = addon.get("name", "")
+                if "evcc" in slug.lower() or "evcc" in name.lower():
+                    logger.info("Discovered EVCC add-on in Supervisor: slug='%s', state='%s'", slug, addon.get("state"))
+                    discovered.append(f"http://{slug}:7070")
+                    discovered.append(f"http://{slug.replace('_', '-')}:7070")
+                    discovered.append(f"http://{slug.replace('-', '_')}:7070")
+    except Exception as err:
+        logger.debug("Supervisor add-on query notice: %s", err)
+
+    return discovered
+
+
 def get_candidate_evcc_urls() -> list[str]:
     """Builds a prioritized list of EVCC candidate endpoints."""
-    configured = CONFIG.get("evcc_url", "http://127.0.0.1:7070").rstrip("/")
-    candidates = [
-        configured,
+    configured = CONFIG.get("evcc_url", "").strip().rstrip("/")
+    candidates = []
+
+    if configured:
+        candidates.append(configured)
+
+    # Add discovered supervisor add-on hostnames
+    candidates.extend(discover_evcc_from_supervisor())
+
+    # Fallback host network and local addresses
+    candidates.extend([
         "http://127.0.0.1:7070",
         "http://localhost:7070",
         "http://homeassistant.local:7070",
+        "http://homeassistant:7070",
         "http://a0d7b954-evcc:7070",
         "http://a0d7b954_evcc:7070",
         "http://evcc:7070",
         "http://local-evcc:7070",
-    ]
+    ])
+
     # Deduplicate while preserving order
     seen = set()
     result = []
@@ -124,7 +165,7 @@ def get_current_evcc_token() -> str | None:
                 f"{base_url}/api/state",
                 headers={"User-Agent": "HomeAssistant-HETS/1.0"},
             )
-            with urllib.request.urlopen(req, timeout=5) as resp:
+            with urllib.request.urlopen(req, timeout=4) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 result = data.get("result", {})
                 token = result.get("sponsorToken") or result.get("sponsortoken")
@@ -138,6 +179,7 @@ def get_current_evcc_token() -> str | None:
 def push_token_to_evcc(token: str) -> bool:
     """Posts the new token to EVCC configuration endpoint across candidate URLs."""
     candidate_urls = get_candidate_evcc_urls()
+    errors = []
 
     for base_url in candidate_urls:
         endpoint = f"{base_url}/api/sponsortoken"
@@ -155,22 +197,24 @@ def push_token_to_evcc(token: str) -> bool:
                     },
                     method="POST",
                 )
-                with urllib.request.urlopen(req, timeout=5) as resp:
+                with urllib.request.urlopen(req, timeout=4) as resp:
                     if resp.status in [200, 204]:
-                        logger.info("Successfully pushed token to EVCC at %s", endpoint)
-                        # Remember working URL
+                        logger.info("Successfully connected and pushed token to EVCC at %s", endpoint)
                         CONFIG["evcc_url"] = base_url
                         return True
             except urllib.error.HTTPError as err:
                 if err.code in [200, 204]:
-                    logger.info("Successfully pushed token to EVCC at %s (code %s)", endpoint, err.code)
+                    logger.info("Successfully pushed token to EVCC at %s (HTTP %s)", endpoint, err.code)
                     CONFIG["evcc_url"] = base_url
                     return True
-                logger.debug("HTTP Error at %s: %s", endpoint, err)
+                errors.append(f"{endpoint} -> HTTP {err.code}: {err.reason}")
             except Exception as err:
-                logger.debug("Connection failed to %s: %s", endpoint, err)
+                errors.append(f"{endpoint} -> {err}")
 
-    logger.error("Could not reach any EVCC endpoints: %s", candidate_urls)
+    logger.error("Could not reach EVCC at any candidate endpoints:")
+    for err in errors[:5]:  # Log first 5 failure reasons
+        logger.error("  - %s", err)
+    logger.info("TIP: In HETS App Configuration, set 'evcc_url' to your exact EVCC IP:port (e.g. http://192.168.1.50:7070)")
     return False
 
 
