@@ -2,6 +2,7 @@
 """
 Standalone EVCC Test Token Auto-Sync
 Can be run via cron, AppDaemon, or Home Assistant shell_command.
+Uses pure standard library for zero dependencies.
 """
 
 import argparse
@@ -10,15 +11,17 @@ import json
 import logging
 import re
 import sys
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
-import requests
 
 logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s] %(levelname)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-logger = logging.getLogger("evcc_token_sync")
+logger = logging.getLogger("hets_standalone")
 
 SOURCES = [
     "https://raw.githubusercontent.com/evcc-io/docs/main/docs/sponsorship.md",
@@ -44,19 +47,20 @@ def decode_jwt_payload(token: str) -> dict:
 
 
 def fetch_latest_token() -> str | None:
-    headers = {"User-Agent": "HomeAssistant-EVCCTokenSync/1.0"}
     jwt_regex = re.compile(r"eyJ[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+")
-
     best_token = None
     latest_exp = 0
 
     for url in SOURCES:
         try:
-            resp = requests.get(url, headers=headers, timeout=15)
-            if resp.status_code != 200:
-                continue
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "HomeAssistant-HETS/1.0"},
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                text = resp.read().decode("utf-8", errors="ignore")
 
-            matches = jwt_regex.findall(resp.text)
+            matches = jwt_regex.findall(text)
             for candidate in matches:
                 payload = decode_jwt_payload(candidate)
                 exp = payload.get("exp", 0)
@@ -73,16 +77,30 @@ def push_token_to_evcc(evcc_url: str, token: str) -> bool:
     endpoint = f"{evcc_url.rstrip('/')}/api/sponsortoken"
     for payload in [{"token": token}, {"sponsortoken": token}]:
         try:
-            res = requests.post(endpoint, json=payload, timeout=10)
-            if res.status_code in [200, 204]:
+            data = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(
+                endpoint,
+                data=data,
+                headers={
+                    "Content-Type": "application/json",
+                    "User-Agent": "HomeAssistant-HETS/1.0",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                if resp.status in [200, 204]:
+                    return True
+        except urllib.error.HTTPError as err:
+            if err.code in [200, 204]:
                 return True
+            logger.error("HTTP error pushing to %s: %s", endpoint, err)
         except Exception as err:
             logger.error("Failed pushing to %s: %s", endpoint, err)
     return False
 
 
 def main():
-    parser = argparse.ArgumentParser(description="EVCC Test Token Sync Script")
+    parser = argparse.ArgumentParser(description="EVCC Test Token Sync Script (HETS)")
     parser.add_argument(
         "--evcc-url",
         default="http://localhost:7070",

@@ -3,8 +3,6 @@ FROM ${BUILD_FROM}
 
 ENV LANG=C.UTF-8
 
-RUN apk add --no-cache python3 py3-requests py3-pip
-
 WORKDIR /app
 COPY sync.py /app/sync.py
 RUN chmod +x /app/sync.py

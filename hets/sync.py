@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-EVCC Test Token Auto-Sync
+HETS (EVCC Test Token Auto-Sync)
 Automatically checks for renewed/updated EVCC trial sponsor tokens
 and updates the local EVCC instance.
+Uses pure standard library for zero-dependency reliability.
 """
 
 import base64
@@ -12,15 +13,17 @@ import os
 import re
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
-import requests
 
 logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s] %(levelname)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-logger = logging.getLogger("evcc_token_sync")
+logger = logging.getLogger("hets_sync")
 
 OPTIONS_PATH = "/data/options.json"
 CONFIG = {
@@ -63,23 +66,22 @@ def decode_jwt_payload(token: str) -> dict:
 
 def fetch_latest_token() -> str | None:
     """Scrapes candidate sources for the latest valid sponsor JWT."""
-    headers = {"User-Agent": "HomeAssistant-EVCCTokenSync/1.0"}
     jwt_regex = re.compile(r"eyJ[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+")
-
     best_token = None
     latest_exp = 0
 
     for url in SOURCES:
         try:
-            logger.debug("Checking source URL: %s", url)
-            resp = requests.get(url, headers=headers, timeout=15)
-            if resp.status_code != 200:
-                continue
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "HomeAssistant-HETS/1.0"},
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                text = resp.read().decode("utf-8", errors="ignore")
 
-            matches = jwt_regex.findall(resp.text)
+            matches = jwt_regex.findall(text)
             for candidate in matches:
                 payload = decode_jwt_payload(candidate)
-                # Ensure the payload contains typical sponsor token claims
                 exp = payload.get("exp", 0)
                 if exp > latest_exp:
                     latest_exp = exp
@@ -92,12 +94,12 @@ def fetch_latest_token() -> str | None:
 
 
 def get_current_evcc_token() -> str | None:
-    """Fetches the currently active sponsor token or status from EVCC API."""
+    """Fetches the currently active sponsor token from EVCC API."""
     evcc_url = CONFIG.get("evcc_url", "").rstrip("/")
     try:
-        resp = requests.get(f"{evcc_url}/api/state", timeout=10)
-        if resp.status_code == 200:
-            data = resp.json()
+        req = urllib.request.Request(f"{evcc_url}/api/state", headers={"User-Agent": "HomeAssistant-HETS/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
             result = data.get("result", {})
             return result.get("sponsorToken") or result.get("sponsortoken")
     except Exception as err:
@@ -113,9 +115,23 @@ def push_token_to_evcc(token: str) -> bool:
     payloads = [{"token": token}, {"sponsortoken": token}]
     for payload in payloads:
         try:
-            res = requests.post(endpoint, json=payload, timeout=10)
-            if res.status_code in [200, 204]:
+            data = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(
+                endpoint,
+                data=data,
+                headers={
+                    "Content-Type": "application/json",
+                    "User-Agent": "HomeAssistant-HETS/1.0",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                if resp.status in [200, 204]:
+                    return True
+        except urllib.error.HTTPError as err:
+            if err.code in [200, 204]:
                 return True
+            logger.error("HTTP error sending token to %s: %s", endpoint, err)
         except Exception as err:
             logger.error("Error sending token to %s: %s", endpoint, err)
 
@@ -134,16 +150,22 @@ def send_ha_notification(title: str, message: str) -> None:
 
     try:
         url = "http://supervisor/core/api/services/persistent_notification/create"
-        headers = {
-            "Authorization": f"Bearer {supervisor_token}",
-            "Content-Type": "application/json",
-        }
-        body = {
+        body = json.dumps({
             "title": title,
             "message": message,
             "notification_id": "evcc_test_token_sync",
-        }
-        requests.post(url, headers=headers, json=body, timeout=10)
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=body,
+            headers={
+                "Authorization": f"Bearer {supervisor_token}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            pass
     except Exception as err:
         logger.warning("Failed sending HA persistent notification: %s", err)
 
@@ -184,7 +206,7 @@ def run_sync_cycle(last_token: str | None) -> str | None:
 
 
 def main():
-    logger.info("Starting EVCC Test Token Auto-Sync service")
+    logger.info("Starting EVCC Test Token Auto-Sync service (HETS)")
     logger.info("Configured EVCC URL: %s", CONFIG.get("evcc_url"))
     interval_hours = max(1, int(CONFIG.get("check_interval_hours", 6)))
     logger.info("Check interval: every %d hours", interval_hours)
