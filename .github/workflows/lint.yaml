@@ -1,0 +1,40 @@
+name: Validate & Lint
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  lint-addon:
+    name: Lint Home Assistant Add-on
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Home Assistant Add-on Linter
+        uses: frenck/action-addon-linter@v2
+        with:
+          path: "./hets"
+
+  python-check:
+    name: Test Python Scripts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install requests pyflakes
+
+      - name: Syntax check
+        run: |
+          pyflakes hets/sync.py standalone/evcc_token_sync.py
