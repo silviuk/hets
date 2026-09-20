@@ -2,7 +2,7 @@
 """
 HETS (EVCC Test Token Auto-Sync)
 Intelligently syncs EVCC test sponsor tokens just before expiration.
-Supports dual-mode updates: Live REST API + Direct evcc.yaml / Supervisor Restart fallback.
+Updates only when the upstream token is genuinely different from the active token.
 """
 
 import base64
@@ -211,11 +211,45 @@ def get_auth_headers() -> dict:
     }
     password = CONFIG.get("evcc_password", "").strip()
     if password:
-        # EVCC basic auth or bearer
         auth_str = f"admin:{password}"
         b64_auth = base64.b64encode(auth_str.encode("utf-8")).decode("utf-8")
         headers["Authorization"] = f"Basic {b64_auth}"
     return headers
+
+
+def find_evcc_yaml_paths() -> list[str]:
+    """Finds all potential evcc.yaml file locations on the Home Assistant disk."""
+    patterns = [
+        "/addon_configs/*evcc*/evcc.yaml",
+        "/addon_configs/evcc.yaml",
+        "/config/evcc.yaml",
+        "/share/evcc.yaml",
+        "/homeassistant/evcc.yaml",
+    ]
+    found = []
+    for pat in patterns:
+        for match in glob.glob(pat):
+            if os.path.isfile(match):
+                found.append(match)
+    return found
+
+
+def read_existing_token_from_disk() -> tuple[str | None, int]:
+    """Reads the current token configured in evcc.yaml if accessible."""
+    for ypath in find_evcc_yaml_paths():
+        try:
+            with open(ypath, "r", encoding="utf-8") as f:
+                content = f.read()
+            match = re.search(r"(?m)^\s*sponsortoken:\s*['\"]?([a-zA-Z0-9_\-\.]+)['\"]?", content)
+            if match:
+                token = match.group(1).strip()
+                payload = decode_jwt_payload(token)
+                exp = payload.get("exp", 0)
+                logger.info("Read existing token from %s (Expires: %s)", ypath, format_timestamp(exp))
+                return token, exp
+        except Exception as err:
+            logger.debug("Could not read from %s: %s", ypath, err)
+    return None, 0
 
 
 def push_token_to_evcc_api(token: str) -> bool:
@@ -262,26 +296,10 @@ def push_token_to_evcc_api(token: str) -> bool:
     return False
 
 
-def find_evcc_yaml_paths() -> list[str]:
-    """Finds all potential evcc.yaml file locations on the Home Assistant disk."""
-    patterns = [
-        "/addon_configs/*evcc*/evcc.yaml",
-        "/addon_configs/evcc.yaml",
-        "/config/evcc.yaml",
-        "/share/evcc.yaml",
-        "/homeassistant/evcc.yaml",
-    ]
-    found = []
-    for pat in patterns:
-        for match in glob.glob(pat):
-            if os.path.isfile(match):
-                found.append(match)
-    return found
-
-
 def update_evcc_yaml_and_restart(token: str) -> bool:
     """
-    Fallback method: Direct file update on evcc.yaml + Supervisor add-on restart.
+    Direct file update on evcc.yaml + Supervisor add-on restart.
+    Only writes and restarts if the token is genuinely different.
     """
     yaml_files = find_evcc_yaml_paths()
     if not yaml_files:
@@ -306,16 +324,16 @@ def update_evcc_yaml_and_restart(token: str) -> bool:
             if new_content != content:
                 with open(ypath, "w", encoding="utf-8") as f:
                     f.write(new_content)
-                logger.info("Successfully updated sponsortoken in %s", ypath)
+                logger.info("Updated sponsortoken in %s", ypath)
                 updated_any = True
             else:
-                logger.info("Token in %s was already up-to-date", ypath)
-                updated_any = True
+                logger.info("Token in %s is already identical to upstream token. No file write needed.", ypath)
         except Exception as err:
             logger.error("Error writing to %s: %s", ypath, err)
 
     if not updated_any:
-        return False
+        # File was already up-to-date, no restart needed
+        return True
 
     # Restart EVCC Add-on via Supervisor API to load new YAML
     supervisor_token = os.environ.get("SUPERVISOR_TOKEN")
@@ -338,7 +356,7 @@ def update_evcc_yaml_and_restart(token: str) -> bool:
                 return True
         except Exception as err:
             logger.warning("Could not restart EVCC add-on automatically: %s", err)
-            return True  # File was written successfully anyway
+            return True
 
     return True
 
@@ -400,8 +418,8 @@ def main():
     lan_ips = detect_host_lan_ips()
     logger.info("Detected Host LAN IPs: %s", lan_ips)
 
-    active_token = None
-    active_exp = 0
+    # Initialize active token from disk if available
+    active_token, active_exp = read_existing_token_from_disk()
 
     while True:
         now = int(time.time())
@@ -416,8 +434,9 @@ def main():
         exp_str = format_timestamp(latest_exp)
         seconds_left = latest_exp - now
 
-        if latest_token != active_token or seconds_left <= 0:
-            logger.info("New/Renewed token found (Expires: %s, remaining: %ds)", exp_str, seconds_left)
+        # Only apply update if the token is genuinely DIFFERENT or currently expired
+        if latest_token != active_token:
+            logger.info("New token detected! (Expires: %s, remaining: %ds). Applying update...", exp_str, seconds_left)
             if apply_token_to_evcc(latest_token):
                 active_token = latest_token
                 active_exp = latest_exp
@@ -430,7 +449,8 @@ def main():
                 time.sleep(60)
                 continue
         else:
-            logger.info("Current token is active (Expires: %s)", exp_str)
+            logger.info("Token is already up to date and identical to active token (Expires: %s).", exp_str)
+            active_exp = latest_exp
 
         # Re-calculate remaining seconds
         now = int(time.time())
@@ -439,11 +459,12 @@ def main():
         if seconds_left > 300:
             # Token is valid for more than 5 minutes -> Sleep until 4 minutes before expiry
             sleep_duration = seconds_left - 240  # 4 mins before expiry
-            sleep_duration = min(sleep_duration, 3600)  # Max 1 hr check
+            sleep_duration = min(sleep_duration, 3600)  # Max 1 hr health check
             wake_time = format_timestamp(now + sleep_duration)
             logger.info("Token valid for %d minutes. Sleeping until %s (4 min before expiration).", seconds_left // 60, wake_time)
             time.sleep(sleep_duration)
         else:
+            # Within 5 minutes of expiration -> Active poll every 60s for the newly published token
             logger.info("Token is near/past expiration (%ds remaining). Actively polling upstream every 60s...", max(0, seconds_left))
             time.sleep(60)
 

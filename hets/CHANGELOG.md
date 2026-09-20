@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.9
+- Guaranteed token change execution only when the upstream token is genuinely different from the active token in memory and on disk (`evcc.yaml`).
+- Auto-initializes state from existing `evcc.yaml` on container boot to prevent redundant updates and restarts.
+
 ## 1.0.8
 - Added **Dual-Mode Update Engine**: If the EVCC REST API is locked or restricted, HETS automatically locates `evcc.yaml` on disk (`/addon_configs/` or `/config/`), updates `sponsortoken:`, and triggers an automated EVCC add-on restart via Home Assistant Supervisor.
 - Added optional `evcc_password` setting to authenticate when EVCC has admin password protection enabled.
