@@ -2,9 +2,11 @@
 """
 HETS (EVCC Test Token Auto-Sync)
 Intelligently syncs EVCC test sponsor tokens just before expiration.
+Supports dual-mode updates: Live REST API + Direct evcc.yaml / Supervisor Restart fallback.
 """
 
 import base64
+import glob
 import json
 import logging
 import os
@@ -27,6 +29,7 @@ logger = logging.getLogger("hets_sync")
 OPTIONS_PATH = "/data/options.json"
 CONFIG = {
     "evcc_url": "",
+    "evcc_password": "",
     "notify_ha": True,
 }
 
@@ -133,13 +136,14 @@ def detect_host_lan_ips() -> list[str]:
     return list(ips)
 
 
-def discover_evcc_from_supervisor() -> list[str]:
-    """Queries Home Assistant Supervisor to auto-discover EVCC add-on hostname/slug."""
+def discover_evcc_from_supervisor() -> tuple[list[str], str | None]:
+    """Queries Home Assistant Supervisor to auto-discover EVCC add-on hostnames and slug."""
     supervisor_token = os.environ.get("SUPERVISOR_TOKEN")
     if not supervisor_token:
-        return []
+        return [], None
 
     discovered = []
+    evcc_slug = None
     try:
         req = urllib.request.Request(
             "http://supervisor/addons",
@@ -155,6 +159,7 @@ def discover_evcc_from_supervisor() -> list[str]:
                 slug = addon.get("slug", "")
                 name = addon.get("name", "")
                 if "evcc" in slug.lower() or "evcc" in name.lower():
+                    evcc_slug = slug
                     logger.info("Discovered EVCC in Supervisor: slug='%s', state='%s'", slug, addon.get("state"))
                     discovered.append(f"http://{slug}:7070")
                     discovered.append(f"http://{slug.replace('_', '-')}:7070")
@@ -162,7 +167,7 @@ def discover_evcc_from_supervisor() -> list[str]:
     except Exception as err:
         logger.debug("Supervisor add-on query notice: %s", err)
 
-    return discovered
+    return discovered, evcc_slug
 
 
 def get_candidate_evcc_urls() -> list[str]:
@@ -177,7 +182,8 @@ def get_candidate_evcc_urls() -> list[str]:
     for ip in lan_ips:
         candidates.append(f"http://{ip}:7070")
 
-    candidates.extend(discover_evcc_from_supervisor())
+    discovered, _ = discover_evcc_from_supervisor()
+    candidates.extend(discovered)
 
     candidates.extend([
         "http://homeassistant.local:7070",
@@ -198,30 +204,23 @@ def get_candidate_evcc_urls() -> list[str]:
     return result
 
 
-def get_current_evcc_token() -> tuple[str | None, int]:
-    """Fetches currently configured token from EVCC state API and returns (token, exp_timestamp)."""
-    for base_url in get_candidate_evcc_urls():
-        try:
-            req = urllib.request.Request(
-                f"{base_url}/api/state",
-                headers={"User-Agent": "HomeAssistant-HETS/1.0"},
-            )
-            with urllib.request.urlopen(req, timeout=4) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                result = data.get("result", {})
-                token = result.get("sponsorToken") or result.get("sponsortoken")
-                if token:
-                    payload = decode_jwt_payload(token)
-                    return token, payload.get("exp", 0)
-        except Exception:
-            continue
-    return None, 0
+def get_auth_headers() -> dict:
+    """Builds HTTP headers with optional password / basic auth."""
+    headers = {
+        "User-Agent": "HomeAssistant-HETS/1.0",
+    }
+    password = CONFIG.get("evcc_password", "").strip()
+    if password:
+        # EVCC basic auth or bearer
+        auth_str = f"admin:{password}"
+        b64_auth = base64.b64encode(auth_str.encode("utf-8")).decode("utf-8")
+        headers["Authorization"] = f"Basic {b64_auth}"
+    return headers
 
 
-def push_token_to_evcc(token: str) -> bool:
+def push_token_to_evcc_api(token: str) -> bool:
     """
-    Posts the new token to EVCC configuration endpoints.
-    Tries official /api/sponsortoken, /config/sponsortoken, /sponsortoken.
+    Attempts to post the new token to EVCC configuration endpoints.
     """
     candidate_urls = get_candidate_evcc_urls()
     api_paths = ["/api/sponsortoken", "/config/sponsortoken", "/sponsortoken", "/api/config/sponsortoken"]
@@ -231,23 +230,24 @@ def push_token_to_evcc(token: str) -> bool:
         ("text/plain", token.encode("utf-8")),
     ]
 
+    base_headers = get_auth_headers()
+
     for base_url in candidate_urls:
         for path in api_paths:
             endpoint = f"{base_url}{path}"
             for content_type, data in payload_formats:
+                headers = dict(base_headers)
+                headers["Content-Type"] = content_type
                 try:
                     req = urllib.request.Request(
                         endpoint,
                         data=data,
-                        headers={
-                            "Content-Type": content_type,
-                            "User-Agent": "HomeAssistant-HETS/1.0",
-                        },
+                        headers=headers,
                         method="POST",
                     )
                     with urllib.request.urlopen(req, timeout=4) as resp:
                         if resp.status in [200, 204]:
-                            logger.info("Successfully pushed token to EVCC at %s", endpoint)
+                            logger.info("Successfully pushed token to EVCC via REST API at %s", endpoint)
                             CONFIG["evcc_url"] = base_url
                             return True
                 except urllib.error.HTTPError as err:
@@ -259,7 +259,102 @@ def push_token_to_evcc(token: str) -> bool:
                 except Exception as err:
                     logger.debug("Connection failed to %s: %s", endpoint, err)
 
-    logger.error("Could not reach EVCC at any candidate endpoints.")
+    return False
+
+
+def find_evcc_yaml_paths() -> list[str]:
+    """Finds all potential evcc.yaml file locations on the Home Assistant disk."""
+    patterns = [
+        "/addon_configs/*evcc*/evcc.yaml",
+        "/addon_configs/evcc.yaml",
+        "/config/evcc.yaml",
+        "/share/evcc.yaml",
+        "/homeassistant/evcc.yaml",
+    ]
+    found = []
+    for pat in patterns:
+        for match in glob.glob(pat):
+            if os.path.isfile(match):
+                found.append(match)
+    return found
+
+
+def update_evcc_yaml_and_restart(token: str) -> bool:
+    """
+    Fallback method: Direct file update on evcc.yaml + Supervisor add-on restart.
+    """
+    yaml_files = find_evcc_yaml_paths()
+    if not yaml_files:
+        logger.debug("No accessible evcc.yaml files found in /addon_configs or /config")
+        return False
+
+    updated_any = False
+    for ypath in yaml_files:
+        try:
+            with open(ypath, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            if "sponsortoken:" in content:
+                new_content = re.sub(
+                    r"(?m)^(\s*sponsortoken:\s*).*$",
+                    rf"\g<1>{token}",
+                    content,
+                )
+            else:
+                new_content = f"sponsortoken: {token}\n" + content
+
+            if new_content != content:
+                with open(ypath, "w", encoding="utf-8") as f:
+                    f.write(new_content)
+                logger.info("Successfully updated sponsortoken in %s", ypath)
+                updated_any = True
+            else:
+                logger.info("Token in %s was already up-to-date", ypath)
+                updated_any = True
+        except Exception as err:
+            logger.error("Error writing to %s: %s", ypath, err)
+
+    if not updated_any:
+        return False
+
+    # Restart EVCC Add-on via Supervisor API to load new YAML
+    supervisor_token = os.environ.get("SUPERVISOR_TOKEN")
+    _, evcc_slug = discover_evcc_from_supervisor()
+
+    if supervisor_token and evcc_slug:
+        try:
+            logger.info("Triggering restart of EVCC add-on (%s) via Supervisor...", evcc_slug)
+            req = urllib.request.Request(
+                f"http://supervisor/addons/{evcc_slug}/restart",
+                data=b"{}",
+                headers={
+                    "Authorization": f"Bearer {supervisor_token}",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                logger.info("EVCC add-on restarted successfully!")
+                return True
+        except Exception as err:
+            logger.warning("Could not restart EVCC add-on automatically: %s", err)
+            return True  # File was written successfully anyway
+
+    return True
+
+
+def apply_token_to_evcc(token: str) -> bool:
+    """Applies the token using live REST API, falling back to direct YAML + restart if needed."""
+    logger.info("Attempting live update via EVCC REST API...")
+    if push_token_to_evcc_api(token):
+        return True
+
+    logger.warning("REST API rejected/unreachable. Attempting direct evcc.yaml file update + add-on restart fallback...")
+    if update_evcc_yaml_and_restart(token):
+        logger.info("Token successfully applied via evcc.yaml fallback!")
+        return True
+
+    logger.error("All update methods failed. Please verify that EVCC is running and accessible.")
     return False
 
 
@@ -323,7 +418,7 @@ def main():
 
         if latest_token != active_token or seconds_left <= 0:
             logger.info("New/Renewed token found (Expires: %s, remaining: %ds)", exp_str, seconds_left)
-            if push_token_to_evcc(latest_token):
+            if apply_token_to_evcc(latest_token):
                 active_token = latest_token
                 active_exp = latest_exp
                 send_ha_notification(
@@ -331,7 +426,7 @@ def main():
                     message=f"EVCC test sponsor token renewed successfully.\n\n**Valid until:** {exp_str}",
                 )
             else:
-                logger.error("Failed to push token to EVCC. Will retry in 60s...")
+                logger.error("Failed to apply token to EVCC. Will retry in 60s...")
                 time.sleep(60)
                 continue
         else:
@@ -344,13 +439,11 @@ def main():
         if seconds_left > 300:
             # Token is valid for more than 5 minutes -> Sleep until 4 minutes before expiry
             sleep_duration = seconds_left - 240  # 4 mins before expiry
-            # Cap maximum sleep at 1 hour for regular health checking
-            sleep_duration = min(sleep_duration, 3600)
+            sleep_duration = min(sleep_duration, 3600)  # Max 1 hr check
             wake_time = format_timestamp(now + sleep_duration)
             logger.info("Token valid for %d minutes. Sleeping until %s (4 min before expiration).", seconds_left // 60, wake_time)
             time.sleep(sleep_duration)
         else:
-            # Within 5 minutes of expiration -> Active poll every 60s for the newly published token
             logger.info("Token is near/past expiration (%ds remaining). Actively polling upstream every 60s...", max(0, seconds_left))
             time.sleep(60)
 

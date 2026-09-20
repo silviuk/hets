@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.8
+- Added **Dual-Mode Update Engine**: If the EVCC REST API is locked or restricted, HETS automatically locates `evcc.yaml` on disk (`/addon_configs/` or `/config/`), updates `sponsortoken:`, and triggers an automated EVCC add-on restart via Home Assistant Supervisor.
+- Added optional `evcc_password` setting to authenticate when EVCC has admin password protection enabled.
+
 ## 1.0.7
 - Added **Smart Expiry Timing**: Sleeps automatically until 4 minutes prior to token expiration, then actively checks every 60s for the newly published token.
 - Verified and expanded EVCC configuration endpoints (`/api/sponsortoken`, `/config/sponsortoken`, `/sponsortoken`) supporting JSON and raw payloads.
