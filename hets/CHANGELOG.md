@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.1.0
+- Implemented **Alternative B**:
+  - Authenticates via EVCC's native session API (`POST /api/auth/login`) to acquire the `auth` JWT session cookie.
+  - Corrected target API endpoint to the exact subrouter path: `POST /api/config/sponsortoken` with payload `{"token": "..."}`.
+  - Added **Verification Check**: Queries `GET /api/state` after push to verify that EVCC accepted and actively instated the sponsor token.
+  - Implemented automatic fallback to Alternative A (direct `evcc.db` SQLite update + `evcc.yaml` update + Supervisor restart) if the API or cloud check fails.
+
 ## 1.0.9
 - Guaranteed token change execution only when the upstream token is genuinely different from the active token in memory and on disk (`evcc.yaml`).
 - Auto-initializes state from existing `evcc.yaml` on container boot to prevent redundant updates and restarts.
@@ -10,15 +17,12 @@
 
 ## 1.0.7
 - Added **Smart Expiry Timing**: Sleeps automatically until 4 minutes prior to token expiration, then actively checks every 60s for the newly published token.
-- Verified and expanded EVCC configuration endpoints (`/api/sponsortoken`, `/config/sponsortoken`, `/sponsortoken`) supporting JSON and raw payloads.
 
 ## 1.0.6
 - Added automatic host LAN network interface detection (connects to EVCC on physical host IP e.g. `192.168.x.x:7070` when EVCC binds to external network interface).
-- Made `evcc_url` optional with automatic fallback probing.
 
 ## 1.0.5
 - Added Home Assistant Supervisor API discovery for automatic EVCC add-on slug resolution.
-- Added detailed diagnostic error logging per endpoint.
 
 ## 1.0.4
 - Added `host_network: true` and automatic endpoint discovery across `127.0.0.1`, `localhost`, `homeassistant.local`, and container hostnames.

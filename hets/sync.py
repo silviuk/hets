@@ -2,7 +2,8 @@
 """
 HETS (EVCC Test Token Auto-Sync)
 Intelligently syncs EVCC test sponsor tokens just before expiration.
-Updates only when the upstream token is genuinely different from the active token.
+Attempts proper Alternative B (authenticated API session + verification) first,
+with automated SQLite database / YAML fallback if rejected by cloud check.
 """
 
 import base64
@@ -12,6 +13,7 @@ import logging
 import os
 import re
 import socket
+import sqlite3
 import sys
 import time
 import urllib.error
@@ -204,17 +206,174 @@ def get_candidate_evcc_urls() -> list[str]:
     return result
 
 
-def get_auth_headers() -> dict:
-    """Builds HTTP headers with optional password / basic auth."""
-    headers = {
-        "User-Agent": "HomeAssistant-HETS/1.0",
-    }
+def evcc_login(base_url: str) -> str | None:
+    """
+    Logs in to EVCC via POST /api/auth/login if evcc_password is configured.
+    Returns the auth session cookie string (e.g. 'auth=ey...') or None.
+    """
     password = CONFIG.get("evcc_password", "").strip()
-    if password:
-        auth_str = f"admin:{password}"
-        b64_auth = base64.b64encode(auth_str.encode("utf-8")).decode("utf-8")
-        headers["Authorization"] = f"Basic {b64_auth}"
-    return headers
+    if not password:
+        return None
+
+    login_url = f"{base_url}/api/auth/login"
+    login_payload = json.dumps({"password": password}).encode("utf-8")
+    req = urllib.request.Request(
+        login_url,
+        data=login_payload,
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "HomeAssistant-HETS/1.0",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            for header in resp.headers.get_all("Set-Cookie", []):
+                if "auth=" in header:
+                    cookie = header.split(";")[0].strip()
+                    logger.info("Successfully authenticated with EVCC on %s", base_url)
+                    return cookie
+    except urllib.error.HTTPError as err:
+        logger.warning("EVCC login failed at %s (HTTP %s): %s", login_url, err.code, err.reason)
+    except Exception as err:
+        logger.debug("EVCC login connection error to %s: %s", login_url, err)
+
+    return None
+
+
+def verify_token_instated(base_url: str, cookie: str | None = None) -> tuple[bool, str, str]:
+    """
+    Queries GET /api/state to verify that the token has been accepted and instated in EVCC.
+    Returns (is_instated, sponsor_name, expires_at).
+    """
+    headers = {"User-Agent": "HomeAssistant-HETS/1.0"}
+    if cookie:
+        headers["Cookie"] = cookie
+
+    state_url = f"{base_url}/api/state"
+    try:
+        req = urllib.request.Request(state_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            result = data.get("result", {})
+            sponsor = result.get("sponsor", {})
+            status = sponsor.get("status", {})
+            name = status.get("name") or result.get("sponsorToken")
+            expires_at = status.get("expiresAt", "")
+            if name and name != "sponsorship unavailable":
+                return True, str(name), str(expires_at)
+            elif name == "sponsorship unavailable":
+                logger.warning("EVCC reported sponsor status: 'sponsorship unavailable'")
+    except Exception as err:
+        logger.debug("Verification request failed against %s: %s", state_url, err)
+
+    return False, "", ""
+
+
+def push_token_via_api(token: str) -> bool:
+    """
+    Alternative B:
+    Performs authenticated session login and calls POST /api/config/sponsortoken.
+    Validates that the token was genuinely instated and recognized by EVCC.
+    """
+    candidate_urls = get_candidate_evcc_urls()
+
+    for base_url in candidate_urls:
+        endpoint = f"{base_url}/api/config/sponsortoken"
+        cookie = evcc_login(base_url)
+
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": "HomeAssistant-HETS/1.0",
+        }
+        if cookie:
+            headers["Cookie"] = cookie
+
+        data = json.dumps({"token": token}).encode("utf-8")
+        req = urllib.request.Request(endpoint, data=data, headers=headers, method="POST")
+
+        try:
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                if resp.status in [200, 204]:
+                    resp_body = resp.read().decode("utf-8", errors="ignore")
+                    logger.info("EVCC API accepted token at %s. Response: %s", endpoint, resp_body)
+
+                    # Verify that the token is instated and active in system state
+                    time.sleep(1)
+                    instated, name, expires_at = verify_token_instated(base_url, cookie)
+                    if instated:
+                        logger.info("VERIFICATION CONFIRMED: Token is actively instated in EVCC! Sponsor: '%s', Expires: %s", name, expires_at)
+                        CONFIG["evcc_url"] = base_url
+                        return True
+                    else:
+                        logger.warning("API returned HTTP 200, but EVCC state verification did not report active sponsorship.")
+                        # Check response body for status fields
+                        try:
+                            resp_json = json.loads(resp_body)
+                            if resp_json.get("name") and resp_json.get("name") != "sponsorship unavailable":
+                                logger.info("VERIFICATION CONFIRMED from API response payload: Sponsor: '%s'", resp_json.get("name"))
+                                CONFIG["evcc_url"] = base_url
+                                return True
+                        except Exception:
+                            pass
+        except urllib.error.HTTPError as err:
+            err_msg = err.read().decode("utf-8", errors="ignore")
+            logger.warning("EVCC API rejected request at %s (HTTP %s): %s", endpoint, err.code, err_msg)
+            if err.code == 401:
+                logger.info("NOTE: EVCC requires an admin password. Please set 'evcc_password' in HETS configuration.")
+        except Exception as err:
+            logger.debug("Failed connection to %s: %s", endpoint, err)
+
+    return False
+
+
+def find_evcc_db_paths() -> list[str]:
+    """Finds all potential evcc.db SQLite database locations on the Home Assistant disk."""
+    patterns = [
+        "/addon_configs/*evcc*/evcc.db",
+        "/addon_configs/evcc/evcc.db",
+        "/data/evcc.db",
+        "/config/evcc.db",
+        "/share/evcc.db",
+    ]
+    found = []
+    for pat in patterns:
+        for match in glob.glob(pat):
+            if os.path.isfile(match):
+                found.append(match)
+    return found
+
+
+def update_evcc_sqlite_db(token: str) -> bool:
+    """
+    Direct SQLite update in evcc.db.
+    Inserts or replaces 'sponsorToken' in the 'settings' table.
+    """
+    db_files = find_evcc_db_paths()
+    if not db_files:
+        logger.debug("No accessible evcc.db files found.")
+        return False
+
+    success = False
+    for db_path in db_files:
+        try:
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='settings'")
+            if cursor.fetchone():
+                cursor.execute(
+                    "INSERT INTO settings (key, value) VALUES ('sponsorToken', ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (token,),
+                )
+                conn.commit()
+                logger.info("Successfully updated 'sponsorToken' in SQLite database: %s", db_path)
+                success = True
+            conn.close()
+        except Exception as err:
+            logger.error("Error writing to SQLite DB %s: %s", db_path, err)
+
+    return success
 
 
 def find_evcc_yaml_paths() -> list[str]:
@@ -235,7 +394,25 @@ def find_evcc_yaml_paths() -> list[str]:
 
 
 def read_existing_token_from_disk() -> tuple[str | None, int]:
-    """Reads the current token configured in evcc.yaml if accessible."""
+    """Reads the current token configured in evcc.db or evcc.yaml if accessible."""
+    # First check evcc.db as it takes precedence
+    for db_path in find_evcc_db_paths():
+        try:
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            cursor.execute("SELECT value FROM settings WHERE key='sponsorToken'")
+            row = cursor.fetchone()
+            conn.close()
+            if row and row[0]:
+                token = row[0].strip()
+                payload = decode_jwt_payload(token)
+                exp = payload.get("exp", 0)
+                logger.info("Read active token from SQLite DB %s (Expires: %s)", db_path, format_timestamp(exp))
+                return token, exp
+        except Exception as err:
+            logger.debug("Could not read SQLite %s: %s", db_path, err)
+
+    # Next check evcc.yaml
     for ypath in find_evcc_yaml_paths():
         try:
             with open(ypath, "r", encoding="utf-8") as f:
@@ -245,68 +422,20 @@ def read_existing_token_from_disk() -> tuple[str | None, int]:
                 token = match.group(1).strip()
                 payload = decode_jwt_payload(token)
                 exp = payload.get("exp", 0)
-                logger.info("Read existing token from %s (Expires: %s)", ypath, format_timestamp(exp))
+                logger.info("Read existing token from YAML %s (Expires: %s)", ypath, format_timestamp(exp))
                 return token, exp
         except Exception as err:
             logger.debug("Could not read from %s: %s", ypath, err)
     return None, 0
 
 
-def push_token_to_evcc_api(token: str) -> bool:
-    """
-    Attempts to post the new token to EVCC configuration endpoints.
-    """
-    candidate_urls = get_candidate_evcc_urls()
-    api_paths = ["/api/sponsortoken", "/config/sponsortoken", "/sponsortoken", "/api/config/sponsortoken"]
-    payload_formats = [
-        ("application/json", json.dumps({"token": token}).encode("utf-8")),
-        ("application/json", json.dumps({"sponsortoken": token}).encode("utf-8")),
-        ("text/plain", token.encode("utf-8")),
-    ]
-
-    base_headers = get_auth_headers()
-
-    for base_url in candidate_urls:
-        for path in api_paths:
-            endpoint = f"{base_url}{path}"
-            for content_type, data in payload_formats:
-                headers = dict(base_headers)
-                headers["Content-Type"] = content_type
-                try:
-                    req = urllib.request.Request(
-                        endpoint,
-                        data=data,
-                        headers=headers,
-                        method="POST",
-                    )
-                    with urllib.request.urlopen(req, timeout=4) as resp:
-                        if resp.status in [200, 204]:
-                            logger.info("Successfully pushed token to EVCC via REST API at %s", endpoint)
-                            CONFIG["evcc_url"] = base_url
-                            return True
-                except urllib.error.HTTPError as err:
-                    if err.code in [200, 204]:
-                        logger.info("Successfully pushed token to EVCC at %s (HTTP %s)", endpoint, err.code)
-                        CONFIG["evcc_url"] = base_url
-                        return True
-                    logger.debug("HTTP %s from %s", err.code, endpoint)
-                except Exception as err:
-                    logger.debug("Connection failed to %s: %s", endpoint, err)
-
-    return False
-
-
 def update_evcc_yaml_and_restart(token: str) -> bool:
     """
-    Direct file update on evcc.yaml + Supervisor add-on restart.
-    Only writes and restarts if the token is genuinely different.
+    Fallback method: Direct file update on evcc.yaml + evcc.db + Supervisor add-on restart.
     """
     yaml_files = find_evcc_yaml_paths()
-    if not yaml_files:
-        logger.debug("No accessible evcc.yaml files found in /addon_configs or /config")
-        return False
+    updated_yaml = False
 
-    updated_any = False
     for ypath in yaml_files:
         try:
             with open(ypath, "r", encoding="utf-8") as f:
@@ -325,17 +454,18 @@ def update_evcc_yaml_and_restart(token: str) -> bool:
                 with open(ypath, "w", encoding="utf-8") as f:
                     f.write(new_content)
                 logger.info("Updated sponsortoken in %s", ypath)
-                updated_any = True
-            else:
-                logger.info("Token in %s is already identical to upstream token. No file write needed.", ypath)
+                updated_yaml = True
         except Exception as err:
             logger.error("Error writing to %s: %s", ypath, err)
 
-    if not updated_any:
-        # File was already up-to-date, no restart needed
-        return True
+    # Also update SQLite DB so database precedence aligns with YAML
+    updated_db = update_evcc_sqlite_db(token)
 
-    # Restart EVCC Add-on via Supervisor API to load new YAML
+    if not updated_yaml and not updated_db:
+        logger.debug("No YAML or SQLite DB files could be updated.")
+        return False
+
+    # Restart EVCC Add-on via Supervisor API to load new YAML & DB
     supervisor_token = os.environ.get("SUPERVISOR_TOKEN")
     _, evcc_slug = discover_evcc_from_supervisor()
 
@@ -362,17 +492,21 @@ def update_evcc_yaml_and_restart(token: str) -> bool:
 
 
 def apply_token_to_evcc(token: str) -> bool:
-    """Applies the token using live REST API, falling back to direct YAML + restart if needed."""
-    logger.info("Attempting live update via EVCC REST API...")
-    if push_token_to_evcc_api(token):
+    """
+    Applies the token trying Alternative B (API session + verification) first.
+    Falls back to direct DB/YAML + restart if API push fails.
+    """
+    logger.info("==> Trying Alternative B: Live Authenticated REST API...")
+    if push_token_via_api(token):
+        logger.info("Alternative B succeeded: Token is verified active in EVCC!")
         return True
 
-    logger.warning("REST API rejected/unreachable. Attempting direct evcc.yaml file update + add-on restart fallback...")
+    logger.warning("Alternative B failed. Falling back to Alternative A: Direct SQLite DB/YAML update + restart...")
     if update_evcc_yaml_and_restart(token):
-        logger.info("Token successfully applied via evcc.yaml fallback!")
+        logger.info("Alternative A succeeded: Token successfully applied via disk persistence and EVCC restart!")
         return True
 
-    logger.error("All update methods failed. Please verify that EVCC is running and accessible.")
+    logger.error("All token application methods failed. Check EVCC container status and logs.")
     return False
 
 
@@ -418,7 +552,6 @@ def main():
     lan_ips = detect_host_lan_ips()
     logger.info("Detected Host LAN IPs: %s", lan_ips)
 
-    # Initialize active token from disk if available
     active_token, active_exp = read_existing_token_from_disk()
 
     while True:
@@ -434,7 +567,6 @@ def main():
         exp_str = format_timestamp(latest_exp)
         seconds_left = latest_exp - now
 
-        # Only apply update if the token is genuinely DIFFERENT or currently expired
         if latest_token != active_token:
             logger.info("New token detected! (Expires: %s, remaining: %ds). Applying update...", exp_str, seconds_left)
             if apply_token_to_evcc(latest_token):
@@ -457,14 +589,12 @@ def main():
         seconds_left = active_exp - now
 
         if seconds_left > 300:
-            # Token is valid for more than 5 minutes -> Sleep until 4 minutes before expiry
             sleep_duration = seconds_left - 240  # 4 mins before expiry
             sleep_duration = min(sleep_duration, 3600)  # Max 1 hr health check
             wake_time = format_timestamp(now + sleep_duration)
             logger.info("Token valid for %d minutes. Sleeping until %s (4 min before expiration).", seconds_left // 60, wake_time)
             time.sleep(sleep_duration)
         else:
-            # Within 5 minutes of expiration -> Active poll every 60s for the newly published token
             logger.info("Token is near/past expiration (%ds remaining). Actively polling upstream every 60s...", max(0, seconds_left))
             time.sleep(60)
 

@@ -2,7 +2,7 @@
 """
 Standalone EVCC Test Token Auto-Sync
 Can be run via cron, AppDaemon, or Home Assistant shell_command.
-Uses pure standard library for zero dependencies.
+Uses pure standard library. Implements Alternative B with verification.
 """
 
 import argparse
@@ -11,6 +11,7 @@ import json
 import logging
 import re
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -46,7 +47,7 @@ def decode_jwt_payload(token: str) -> dict:
         return {}
 
 
-def fetch_latest_token() -> str | None:
+def fetch_latest_token() -> tuple[str | None, int]:
     jwt_regex = re.compile(r"eyJ[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+")
     best_token = None
     latest_exp = 0
@@ -57,7 +58,7 @@ def fetch_latest_token() -> str | None:
                 url,
                 headers={"User-Agent": "HomeAssistant-HETS/1.0"},
             )
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            with urllib.request.urlopen(req, timeout=12) as resp:
                 text = resp.read().decode("utf-8", errors="ignore")
 
             matches = jwt_regex.findall(text)
@@ -70,32 +71,79 @@ def fetch_latest_token() -> str | None:
         except Exception as err:
             logger.debug("Error checking source %s: %s", url, err)
 
-    return best_token
+    return best_token, latest_exp
 
 
-def push_token_to_evcc(evcc_url: str, token: str) -> bool:
-    endpoint = f"{evcc_url.rstrip('/')}/api/sponsortoken"
-    for payload in [{"token": token}, {"sponsortoken": token}]:
-        try:
-            data = json.dumps(payload).encode("utf-8")
-            req = urllib.request.Request(
-                endpoint,
-                data=data,
-                headers={
-                    "Content-Type": "application/json",
-                    "User-Agent": "HomeAssistant-HETS/1.0",
-                },
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                if resp.status in [200, 204]:
-                    return True
-        except urllib.error.HTTPError as err:
-            if err.code in [200, 204]:
+def evcc_login(base_url: str, password: str | None) -> str | None:
+    if not password:
+        return None
+
+    login_url = f"{base_url.rstrip('/')}/api/auth/login"
+    login_payload = json.dumps({"password": password}).encode("utf-8")
+    req = urllib.request.Request(
+        login_url,
+        data=login_payload,
+        headers={"Content-Type": "application/json", "User-Agent": "HomeAssistant-HETS/1.0"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            for header in resp.headers.get_all("Set-Cookie", []):
+                if "auth=" in header:
+                    return header.split(";")[0].strip()
+    except Exception as err:
+        logger.debug("Login failed at %s: %s", login_url, err)
+    return None
+
+
+def verify_token_instated(base_url: str, cookie: str | None) -> bool:
+    headers = {"User-Agent": "HomeAssistant-HETS/1.0"}
+    if cookie:
+        headers["Cookie"] = cookie
+
+    try:
+        req = urllib.request.Request(f"{base_url.rstrip('/')}/api/state", headers=headers)
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            result = data.get("result", {})
+            sponsor = result.get("sponsor", {})
+            status = sponsor.get("status", {})
+            name = status.get("name") or result.get("sponsorToken")
+            if name and name != "sponsorship unavailable":
+                logger.info("VERIFICATION CONFIRMED: Token is actively instated in EVCC! Sponsor: '%s', Expires: %s", name, status.get("expiresAt", "N/A"))
                 return True
-            logger.error("HTTP error pushing to %s: %s", endpoint, err)
-        except Exception as err:
-            logger.error("Failed pushing to %s: %s", endpoint, err)
+    except Exception as err:
+        logger.debug("Verification request failed: %s", err)
+    return False
+
+
+def push_token_to_evcc(evcc_url: str, token: str, password: str | None = None) -> bool:
+    base_url = evcc_url.rstrip("/")
+    endpoint = f"{base_url}/api/config/sponsortoken"
+    cookie = evcc_login(base_url, password)
+
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "HomeAssistant-HETS/1.0",
+    }
+    if cookie:
+        headers["Cookie"] = cookie
+
+    data = json.dumps({"token": token}).encode("utf-8")
+    req = urllib.request.Request(endpoint, data=data, headers=headers, method="POST")
+
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            if resp.status in [200, 204]:
+                logger.info("EVCC API accepted token at %s", endpoint)
+                time.sleep(1)
+                return verify_token_instated(base_url, cookie)
+    except urllib.error.HTTPError as err:
+        err_msg = err.read().decode("utf-8", errors="ignore")
+        logger.error("EVCC API rejected request at %s (HTTP %s): %s", endpoint, err.code, err_msg)
+    except Exception as err:
+        logger.error("Failed connection to %s: %s", endpoint, err)
+
     return False
 
 
@@ -106,15 +154,18 @@ def main():
         default="http://localhost:7070",
         help="URL of the EVCC instance (default: http://localhost:7070)",
     )
+    parser.add_argument(
+        "--evcc-password",
+        default="",
+        help="Admin password for EVCC if authentication is enabled",
+    )
     args = parser.parse_args()
 
-    token = fetch_latest_token()
+    token, exp = fetch_latest_token()
     if not token:
         logger.error("No valid sponsor token found.")
         sys.exit(1)
 
-    payload = decode_jwt_payload(token)
-    exp = payload.get("exp")
     exp_str = (
         datetime.fromtimestamp(exp, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         if exp
@@ -122,10 +173,10 @@ def main():
     )
     logger.info("Found token with expiration: %s", exp_str)
 
-    if push_token_to_evcc(args.evcc_url, token):
-        logger.info("EVCC token successfully updated!")
+    if push_token_to_evcc(args.evcc_url, token, args.evcc_password):
+        logger.info("EVCC token successfully updated and verified!")
     else:
-        logger.error("Could not update EVCC token.")
+        logger.error("Could not update/verify EVCC token.")
         sys.exit(2)
 
 
