@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.1.1
+- **SQLite & Disk Reliability Hardening**:
+  - Fixed Home Assistant volume mappings in `config.yaml` (`all_addon_configs:rw`, `homeassistant_config:rw`, `share:rw`) so HETS has full access to `/addon_configs/*evcc*` and `/homeassistant`.
+  - **Stop-Before-Write Lifecycle**: Stops the EVCC add-on *before* modifying `evcc.db` on disk and starts it afterward, preventing EVCC's shutdown hook (`persistSettings`) from overwriting DB updates and eliminating cross-container SQLite WAL (`journal_mode=WAL`) shared-memory corruption.
+  - Added `PRAGMA busy_timeout = 10000;` and `PRAGMA wal_checkpoint(TRUNCATE);` on SQLite updates, and read-only URI mode (`?mode=ro`) when reading `evcc.db`.
+  - Added `DELETE /api/config/sponsortoken` fallback to clear any stale token override in EVCC's private `/data/evcc.db` so `evcc.yaml` is always respected on boot.
+  - Added atomic `evcc.yaml` writes (`os.fsync` + `os.replace`) and post-restart `/api/state` verification.
+
 ## 1.1.0
 - Implemented **Alternative B**:
   - Authenticates via EVCC's native session API (`POST /api/auth/login`) to acquire the `auth` JWT session cookie.

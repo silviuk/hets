@@ -332,33 +332,35 @@ def find_evcc_db_paths() -> list[str]:
     patterns = [
         "/addon_configs/*evcc*/evcc.db",
         "/addon_configs/evcc/evcc.db",
-        "/data/evcc.db",
+        "/homeassistant/evcc.db",
         "/config/evcc.db",
         "/share/evcc.db",
     ]
     found = []
     for pat in patterns:
         for match in glob.glob(pat):
-            if os.path.isfile(match):
+            if os.path.isfile(match) and match not in found:
                 found.append(match)
     return found
 
 
 def update_evcc_sqlite_db(token: str) -> bool:
     """
-    Direct SQLite update in evcc.db.
-    Inserts or replaces 'sponsorToken' in the 'settings' table.
+    Safe SQLite update in evcc.db (designed to run while EVCC is stopped).
+    Uses busy_timeout and WAL truncation checkpoint to prevent WAL index corruption.
     """
     db_files = find_evcc_db_paths()
     if not db_files:
-        logger.debug("No accessible evcc.db files found.")
+        logger.debug("No external evcc.db files found on shared mounts.")
         return False
 
     success = False
     for db_path in db_files:
+        conn = None
         try:
-            conn = sqlite3.connect(db_path)
+            conn = sqlite3.connect(db_path, timeout=15.0)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA busy_timeout = 10000;")
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='settings'")
             if cursor.fetchone():
                 cursor.execute(
@@ -367,11 +369,17 @@ def update_evcc_sqlite_db(token: str) -> bool:
                     (token,),
                 )
                 conn.commit()
-                logger.info("Successfully updated 'sponsorToken' in SQLite database: %s", db_path)
+                try:
+                    cursor.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                except Exception as wal_err:
+                    logger.debug("WAL checkpoint notice on %s: %s", db_path, wal_err)
+                logger.info("Successfully updated and checkpointed 'sponsorToken' in SQLite DB: %s", db_path)
                 success = True
-            conn.close()
         except Exception as err:
             logger.error("Error writing to SQLite DB %s: %s", db_path, err)
+        finally:
+            if conn:
+                conn.close()
 
     return success
 
@@ -380,30 +388,32 @@ def find_evcc_yaml_paths() -> list[str]:
     """Finds all potential evcc.yaml file locations on the Home Assistant disk."""
     patterns = [
         "/addon_configs/*evcc*/evcc.yaml",
+        "/addon_configs/evcc/evcc.yaml",
         "/addon_configs/evcc.yaml",
+        "/homeassistant/evcc.yaml",
         "/config/evcc.yaml",
         "/share/evcc.yaml",
-        "/homeassistant/evcc.yaml",
     ]
     found = []
     for pat in patterns:
         for match in glob.glob(pat):
-            if os.path.isfile(match):
+            if os.path.isfile(match) and match not in found:
                 found.append(match)
     return found
 
 
 def read_existing_token_from_disk() -> tuple[str | None, int]:
     """Reads the current token configured in evcc.db or evcc.yaml if accessible."""
-    # First check evcc.db as it takes precedence
+    # First check evcc.db as non-empty DB settings take precedence over evcc.yaml
     for db_path in find_evcc_db_paths():
+        conn = None
         try:
-            conn = sqlite3.connect(db_path)
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA busy_timeout = 5000;")
             cursor.execute("SELECT value FROM settings WHERE key='sponsorToken'")
             row = cursor.fetchone()
-            conn.close()
-            if row and row[0]:
+            if row and row[0] and row[0].strip():
                 token = row[0].strip()
                 payload = decode_jwt_payload(token)
                 exp = payload.get("exp", 0)
@@ -411,6 +421,9 @@ def read_existing_token_from_disk() -> tuple[str | None, int]:
                 return token, exp
         except Exception as err:
             logger.debug("Could not read SQLite %s: %s", db_path, err)
+        finally:
+            if conn:
+                conn.close()
 
     # Next check evcc.yaml
     for ypath in find_evcc_yaml_paths():
@@ -429,21 +442,138 @@ def read_existing_token_from_disk() -> tuple[str | None, int]:
     return None, 0
 
 
+def clear_db_sponsortoken_via_api() -> bool:
+    """
+    Calls DELETE /api/config/sponsortoken on EVCC.
+    In EVCC's Go backend, DELETE sets sponsorToken='' in evcc.db without any cloud check,
+    which causes EVCC to fall back to reading 'sponsortoken:' from evcc.yaml on startup.
+    Crucial when evcc.db is stored in EVCC's private /data/evcc.db directory.
+    """
+    for base_url in get_candidate_evcc_urls():
+        endpoint = f"{base_url}/api/config/sponsortoken"
+        cookie = evcc_login(base_url)
+        headers = {"User-Agent": "HomeAssistant-HETS/1.0"}
+        if cookie:
+            headers["Cookie"] = cookie
+
+        req = urllib.request.Request(endpoint, headers=headers, method="DELETE")
+        try:
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                if resp.status in [200, 204]:
+                    logger.info("Cleared stale DB sponsorToken override via DELETE %s", endpoint)
+                    return True
+        except Exception as err:
+            logger.debug("DELETE %s notice: %s", endpoint, err)
+    return False
+
+
+def supervisor_addon_action(evcc_slug: str, action: str, timeout: int = 30) -> bool:
+    """Calls POST http://supervisor/addons/{evcc_slug}/{action} (stop, start, restart)."""
+    supervisor_token = os.environ.get("SUPERVISOR_TOKEN")
+    if not supervisor_token or not evcc_slug:
+        return False
+
+    try:
+        req = urllib.request.Request(
+            f"http://supervisor/addons/{evcc_slug}/{action}",
+            data=b"{}",
+            headers={
+                "Authorization": f"Bearer {supervisor_token}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status in [200, 204]
+    except Exception as err:
+        logger.warning("Supervisor action '%s' on '%s' failed: %s", action, evcc_slug, err)
+        return False
+
+
+def wait_for_evcc_online_and_verify(max_wait: int = 45) -> bool:
+    """Polls EVCC after start/restart and verifies that the new sponsor token is instated."""
+    deadline = time.time() + max_wait
+    candidate_urls = get_candidate_evcc_urls()
+
+    while time.time() < deadline:
+        for base_url in candidate_urls:
+            cookie = evcc_login(base_url)
+            instated, name, expires_at = verify_token_instated(base_url, cookie)
+            if instated:
+                logger.info(
+                    "VERIFICATION CONFIRMED after restart: Token is active in EVCC (%s)! Sponsor: '%s', Expires: %s",
+                    base_url,
+                    name,
+                    expires_at,
+                )
+                return True
+        time.sleep(3)
+
+    logger.warning("EVCC restarted, but post-restart state verification timed out or reported unavailable.")
+    return False
+
+
+def atomic_write_file(filepath: str, content: str) -> None:
+    """Atomically writes content to filepath using a temporary file and os.replace."""
+    dir_name = os.path.dirname(filepath) or "."
+    tmp_path = os.path.join(dir_name, f".{os.path.basename(filepath)}.hets.tmp")
+    mode = None
+    if os.path.exists(filepath):
+        mode = os.stat(filepath).st_mode
+
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        f.write(content)
+        f.flush()
+        os.fsync(f.fileno())
+
+    if mode is not None:
+        os.chmod(tmp_path, mode)
+
+    os.replace(tmp_path, filepath)
+
+
 def update_evcc_yaml_and_restart(token: str) -> bool:
     """
-    Fallback method: Direct file update on evcc.yaml + evcc.db + Supervisor add-on restart.
+    Fallback method (Alternative A):
+    1. If evcc.db is in private /data/evcc.db, clears any stale DB token override via DELETE API.
+    2. Stops EVCC add-on BEFORE touching evcc.db to prevent SQLite WAL corruption and
+       EVCC's shutdown hook (`persistSettings`) from overwriting our DB changes.
+    3. Safely updates evcc.db (with WAL checkpoint) and atomically updates evcc.yaml.
+    4. Starts EVCC add-on and verifies that the token is active via /api/state.
     """
+    db_files = find_evcc_db_paths()
     yaml_files = find_evcc_yaml_paths()
-    updated_yaml = False
 
+    if not db_files and not yaml_files:
+        logger.error(
+            "No accessible evcc.db or evcc.yaml found in /addon_configs, /homeassistant, or /share."
+        )
+        return False
+
+    # If no external evcc.db is mounted, EVCC may be using private /data/evcc.db.
+    # Clear any DB override via DELETE /api/config/sponsortoken while EVCC is still running
+    # so EVCC falls back to reading sponsortoken from evcc.yaml on boot.
+    if not db_files:
+        clear_db_sponsortoken_via_api()
+
+    _, evcc_slug = discover_evcc_from_supervisor()
+    stopped_cleanly = False
+
+    if evcc_slug:
+        logger.info("Stopping EVCC add-on (%s) before disk/SQLite update to prevent WAL/flush races...", evcc_slug)
+        stopped_cleanly = supervisor_addon_action(evcc_slug, "stop", timeout=30)
+        if stopped_cleanly:
+            time.sleep(2)
+
+    updated_yaml = False
     for ypath in yaml_files:
         try:
             with open(ypath, "r", encoding="utf-8") as f:
                 content = f.read()
 
-            if "sponsortoken:" in content:
+            if re.search(r"(?m)^\s*sponsortoken\s*:", content):
                 new_content = re.sub(
-                    r"(?m)^(\s*sponsortoken:\s*).*$",
+                    r"(?m)^(\s*sponsortoken\s*:\s*).*$",
                     rf"\g<1>{token}",
                     content,
                 )
@@ -451,44 +581,28 @@ def update_evcc_yaml_and_restart(token: str) -> bool:
                 new_content = f"sponsortoken: {token}\n" + content
 
             if new_content != content:
-                with open(ypath, "w", encoding="utf-8") as f:
-                    f.write(new_content)
-                logger.info("Updated sponsortoken in %s", ypath)
-                updated_yaml = True
+                atomic_write_file(ypath, new_content)
+                logger.info("Atomically updated sponsortoken in %s", ypath)
+            else:
+                logger.info("sponsortoken in %s already matches target token", ypath)
+            updated_yaml = True
         except Exception as err:
             logger.error("Error writing to %s: %s", ypath, err)
 
-    # Also update SQLite DB so database precedence aligns with YAML
+    # Update external SQLite DB while EVCC is stopped
     updated_db = update_evcc_sqlite_db(token)
 
-    if not updated_yaml and not updated_db:
-        logger.debug("No YAML or SQLite DB files could be updated.")
-        return False
+    if evcc_slug:
+        if stopped_cleanly:
+            logger.info("Starting EVCC add-on (%s) via Supervisor...", evcc_slug)
+            supervisor_addon_action(evcc_slug, "start", timeout=30)
+        else:
+            logger.info("Restarting EVCC add-on (%s) via Supervisor...", evcc_slug)
+            supervisor_addon_action(evcc_slug, "restart", timeout=30)
 
-    # Restart EVCC Add-on via Supervisor API to load new YAML & DB
-    supervisor_token = os.environ.get("SUPERVISOR_TOKEN")
-    _, evcc_slug = discover_evcc_from_supervisor()
+        wait_for_evcc_online_and_verify(max_wait=45)
 
-    if supervisor_token and evcc_slug:
-        try:
-            logger.info("Triggering restart of EVCC add-on (%s) via Supervisor...", evcc_slug)
-            req = urllib.request.Request(
-                f"http://supervisor/addons/{evcc_slug}/restart",
-                data=b"{}",
-                headers={
-                    "Authorization": f"Bearer {supervisor_token}",
-                    "Content-Type": "application/json",
-                },
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                logger.info("EVCC add-on restarted successfully!")
-                return True
-        except Exception as err:
-            logger.warning("Could not restart EVCC add-on automatically: %s", err)
-            return True
-
-    return True
+    return updated_yaml or updated_db
 
 
 def apply_token_to_evcc(token: str) -> bool:
