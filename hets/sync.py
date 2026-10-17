@@ -68,16 +68,21 @@ def decode_jwt_payload(token: str) -> dict:
 
 
 def fetch_latest_token() -> tuple[str | None, int]:
-    """Scrapes candidate sources for the latest sponsor JWT and returns (token, exp_timestamp)."""
+    """
+    Scrapes candidate sources for the latest sponsor JWT and returns (token, exp_timestamp).
+    Prioritizes GitHub Raw CDN first and stops early if an unexpired token is found,
+    avoiding unnecessary requests to docs.evcc.io / sponsor.evcc.io.
+    """
     jwt_regex = re.compile(r"eyJ[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+")
     best_token = None
     latest_exp = 0
+    now = int(time.time())
 
     for url in SOURCES:
         try:
             req = urllib.request.Request(
                 url,
-                headers={"User-Agent": "HomeAssistant-HETS/1.0"},
+                headers={"User-Agent": "HomeAssistant-HETS/1.1"},
             )
             with urllib.request.urlopen(req, timeout=12) as resp:
                 text = resp.read().decode("utf-8", errors="ignore")
@@ -89,6 +94,11 @@ def fetch_latest_token() -> tuple[str | None, int]:
                 if exp > latest_exp:
                     latest_exp = exp
                     best_token = candidate
+
+            # If we already found a valid future token (>5m remaining) from GitHub Raw,
+            # return immediately without querying EVCC's web servers.
+            if best_token and (latest_exp - now) > 300:
+                return best_token, latest_exp
         except Exception as err:
             logger.debug("Error checking source %s: %s", url, err)
 
@@ -297,6 +307,16 @@ def push_token_via_api(token: str) -> bool:
                 if resp.status in [200, 204]:
                     resp_body = resp.read().decode("utf-8", errors="ignore")
                     logger.info("EVCC API accepted token at %s. Response: %s", endpoint, resp_body)
+
+                    # EVCC sets configDirty=true on POST /api/config/sponsortoken and requires
+                    # a restart to bind sponsor status to chargers/devices.
+                    _, evcc_slug = discover_evcc_from_supervisor()
+                    if evcc_slug:
+                        logger.info("Restarting EVCC add-on (%s) so the new API token takes full effect...", evcc_slug)
+                        supervisor_addon_action(evcc_slug, "restart", timeout=30)
+                        if wait_for_evcc_online_and_verify(max_wait=45):
+                            CONFIG["evcc_url"] = base_url
+                            return True
 
                     # Verify that the token is instated and active in system state
                     time.sleep(1)
@@ -708,9 +728,27 @@ def main():
             wake_time = format_timestamp(now + sleep_duration)
             logger.info("Token valid for %d minutes. Sleeping until %s (4 min before expiration).", seconds_left // 60, wake_time)
             time.sleep(sleep_duration)
+        elif seconds_left >= -900:
+            # Within 5 min before expiry up to 15 min after expiry: check every 2 minutes
+            logger.info(
+                "Token is in renewal window (%ds relative to expiry). Checking upstream again in 2 minutes...",
+                seconds_left,
+            )
+            time.sleep(120)
+        elif seconds_left >= -3600:
+            # 15 to 60 minutes past expiry: back off to every 10 minutes
+            logger.info(
+                "Upstream token has not been renewed yet (%d min past expiry). Backing off to 10-minute checks...",
+                abs(seconds_left) // 60,
+            )
+            time.sleep(600)
         else:
-            logger.info("Token is near/past expiration (%ds remaining). Actively polling upstream every 60s...", max(0, seconds_left))
-            time.sleep(60)
+            # More than 1 hour past expiry: back off to every 30 minutes
+            logger.info(
+                "Upstream token still unrenewed (%d min past expiry). Backing off to 30-minute checks to avoid rate limits...",
+                abs(seconds_left) // 60,
+            )
+            time.sleep(1800)
 
 
 if __name__ == "__main__":

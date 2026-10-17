@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.2
+- **Automatic EVCC Restart on Token Change**: Verified in EVCC's Go source (`server/http_config_helper.go`) that `POST /api/config/sponsortoken` marks the configuration dirty (`setConfigDirty()`) and requires an EVCC restart for sponsor-dependent chargers and features to initialize. HETS now automatically restarts the EVCC add-on and verifies `/api/state` after both API and DB/YAML updates.
+- **Graduated Backoff & GitHub CDN Priority**:
+  - Prioritizes GitHub Raw CDN (`raw.githubusercontent.com`) and stops early when a valid token is found so `docs.evcc.io` and `sponsor.evcc.io` are not queried unnecessarily.
+  - Added graduated backoff when upstream token publication is delayed past expiration (`2 min` for the first 15 minutes, `10 min` up to 1 hour past expiry, and `30 min` beyond 1 hour) to avoid rate-limiting or IP blocks.
+
 ## 1.1.1
 - **SQLite & Disk Reliability Hardening**:
   - Fixed Home Assistant volume mappings in `config.yaml` (`all_addon_configs:rw`, `homeassistant_config:rw`, `share:rw`) so HETS has full access to `/addon_configs/*evcc*` and `/homeassistant`.
