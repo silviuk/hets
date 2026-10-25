@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.1.3
+- Wait until one hour before the active token expires before checking upstream, including on startup when the current token can be read from disk.
+- Remove the hourly health-check cap and begin two-minute renewal checks at the one-hour boundary; retain the existing backoff after expiry.
+
 ## 1.1.2
 - **Automatic EVCC Restart on Token Change**: Verified in EVCC's Go source (`server/http_config_helper.go`) that `POST /api/config/sponsortoken` marks the configuration dirty (`setConfigDirty()`) and requires an EVCC restart for sponsor-dependent chargers and features to initialize. HETS now automatically restarts the EVCC add-on and verifies `/api/state` after both API and DB/YAML updates.
 - **Graduated Backoff & GitHub CDN Priority**:

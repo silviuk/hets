@@ -38,3 +38,6 @@ jobs:
       - name: Syntax check
         run: |
           pyflakes hets/sync.py standalone/evcc_token_sync.py
+
+      - name: Renewal timing tests
+        run: python -m unittest discover -s tests -v
