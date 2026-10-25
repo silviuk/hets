@@ -14,7 +14,6 @@ import os
 import re
 import socket
 import sqlite3
-import sys
 import time
 import urllib.error
 import urllib.parse
@@ -669,7 +668,7 @@ def send_ha_notification(title: str, message: str) -> None:
             },
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=10):
             pass
     except Exception as err:
         logger.warning("Failed sending HA persistent notification: %s", err)
