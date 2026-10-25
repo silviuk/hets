@@ -72,10 +72,11 @@ If you run Home Assistant Core / Container or prefer running via standard automa
 | Option | Type | Default | Description |
 |---|---|---|---|
 | `evcc_url` | string | `http://a0d7b954-evcc:7070` | Endpoint of your EVCC instance |
-| `check_interval_hours` | int | `6` | Interval between renewal checks |
 | `notify_ha` | bool | `true` | Send persistent notification in HA on renewal |
 
 ---
+
+The App waits until one hour before the active token expires before checking for a replacement. During the renewal window it checks every two minutes, with longer backoff if publication is delayed past expiry. On startup, it uses the current token read from disk; if no token or expiry is available, it checks immediately. This timing applies to the App; standalone automation runs on its configured schedule.
 
 ## License
 

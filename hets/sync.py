@@ -14,7 +14,6 @@ import os
 import re
 import socket
 import sqlite3
-import sys
 import time
 import urllib.error
 import urllib.parse
@@ -669,7 +668,7 @@ def send_ha_notification(title: str, message: str) -> None:
             },
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=10):
             pass
     except Exception as err:
         logger.warning("Failed sending HA persistent notification: %s", err)
@@ -690,6 +689,17 @@ def main():
 
     while True:
         now = int(time.time())
+        # Gate upstream requests on the active token's expiry, including at startup.
+        if active_token and active_exp - now > 3600:
+            sleep_duration = active_exp - now - 3600
+            logger.info(
+                "Token valid until %s. Sleeping until %s (1 hour before expiration).",
+                format_timestamp(active_exp),
+                format_timestamp(now + sleep_duration),
+            )
+            time.sleep(sleep_duration)
+            continue
+
         logger.info("Checking for EVCC test sponsor token...")
         latest_token, latest_exp = fetch_latest_token()
 
@@ -722,14 +732,11 @@ def main():
         now = int(time.time())
         seconds_left = active_exp - now
 
-        if seconds_left > 300:
-            sleep_duration = seconds_left - 240  # 4 mins before expiry
-            sleep_duration = min(sleep_duration, 3600)  # Max 1 hr health check
-            wake_time = format_timestamp(now + sleep_duration)
-            logger.info("Token valid for %d minutes. Sleeping until %s (4 min before expiration).", seconds_left // 60, wake_time)
-            time.sleep(sleep_duration)
+        if seconds_left > 3600:
+            # The next loop sleeps until the replacement token's renewal window.
+            continue
         elif seconds_left >= -900:
-            # Within 5 min before expiry up to 15 min after expiry: check every 2 minutes
+            # From 1 hour before expiry to 15 minutes after: check every 2 minutes
             logger.info(
                 "Token is in renewal window (%ds relative to expiry). Checking upstream again in 2 minutes...",
                 seconds_left,
